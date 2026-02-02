@@ -226,7 +226,7 @@ def page_plate() -> None:
                 help="Steel is ~0.283 lb/in³. Stainless is ~0.289 lb/in³.",
             )
 
-        step_file = st.file_uploader("Upload STEP (.step/.stp)", type=["step", "stp", "STEP", "STP"], accept_multiple_files=False)
+        step_files = st.file_uploader("Upload STEP file(s) (.step/.stp)", type=["step", "stp", "STEP", "STP"], accept_multiple_files=True)
 
 
         def _units_to_inches_factor(units_label: str) -> float:
@@ -373,221 +373,270 @@ def page_plate() -> None:
 
             return overall_metrics, mesh_combined, parts
 
-        if step_file is not None:
+        def _extract_step_parts_table(step_bytes: bytes, filename: str, units_label: str, scale: float, density_lb_in3: float):
+    """
+    Returns:
+      - DataFrame with per-part metrics and editable fields
+      - dict row_id -> trimesh.Trimesh (for previews)
+    Handles single-part STEP and assemblies (Scene with multiple geometries).
+    """
+    import trimesh
+    import pandas as pd
+    import uuid
+
+    scene_or_mesh = trimesh.load(file_obj=io.BytesIO(step_bytes), file_type="step")
+
+    # Convert imported units -> inches, then apply scale.
+    to_in = _units_to_inches_factor(units_label)
+    factor = float(to_in) * float(scale)
+
+    rows = []
+    meshes_by_id = {}
+
+    def mesh_metrics(m: "trimesh.Trimesh"):
+        ext_raw = m.extents
+        bbox_w_in = float(ext_raw[0] * factor)
+        bbox_l_in = float(ext_raw[1] * factor)
+        bbox_h_in = float(ext_raw[2] * factor)
+
+        vol_raw = float(m.volume)
+        vol_in3 = vol_raw * (factor ** 3)
+
+        if not (vol_in3 > 0):
             try:
-                metrics, step_mesh, step_parts = _load_step_metrics(step_file.getvalue(), geom_units, float(step_scale))
-                w_in = metrics["bbox_w_in"]
-                l_in = metrics["bbox_l_in"]
-                h_in = metrics["bbox_h_in"]
-                vol_in3 = metrics["volume_in3"]
-                wt_lbs = vol_in3 * float(density)
+                vol_raw2 = float(m.convex_hull.volume)
+                vol_in3 = vol_raw2 * (factor ** 3)
+            except Exception:
+                vol_in3 = 0.0
 
-                st.write(
-                    {
-                        "File": step_file.name,
-                        "BBox W (in)": round(w_in, 3),
-                        "BBox L (in)": round(l_in, 3),
-                        "BBox H (in)": round(h_in, 3),
-                        "Volume (in³)": round(vol_in3, 3),
-                        "Weight (lb)": round(wt_lbs, 2),
-                    }
-                )
-                # Optional 3D preview (requires: plotly)
-                show_preview = st.checkbox(
-                    "Show 3D preview",
-                    value=True,
-                    help="Interactive preview in your browser (rotate/zoom).",
-                )
-                if show_preview:
-                    try:
-                        fig = _mesh_preview_plotly(step_mesh)
-                        st.plotly_chart(fig, use_container_width=True, height=300)
-                    except Exception as e:
-                        st.warning(f"Preview failed: {e}")
+        wt_lb = float(vol_in3) * float(density_lb_in3)
+        return bbox_w_in, bbox_l_in, bbox_h_in, float(vol_in3), float(wt_lb)
 
+    if isinstance(scene_or_mesh, trimesh.Scene):
+        # Each geometry becomes a row
+        for gname, geom in scene_or_mesh.geometry.items():
+            if not isinstance(geom, trimesh.Trimesh):
+                continue
+            row_id = str(uuid.uuid4())[:8]
+            bw, bl, bh, vol, wt = mesh_metrics(geom)
+            part_name = str(gname) if gname else "Part"
 
-                
-                # ------------------------------------------------------------
-                # Assembly support: if STEP contains multiple bodies/geometries,
-                # show a selectable list so the user can add chosen parts.
-                # ------------------------------------------------------------
-                try:
-                    part_rows = []
-                    for p in step_parts:
-                        vol_in3_p = float(p.get("volume_in3", 0.0) or 0.0)
-                        wt_lbs_p = float(vol_in3_p) * float(density)
-                        part_rows.append(
-                            {
-                                "Include": True,
-                                "Part Name": str(p.get("name", "Part")),
-                                "Quantity": 1,
-                                "Material": str(logic.MATERIALS_LIST[0]) if getattr(logic, "MATERIALS_LIST", None) else "A36",
-                                "Thickness (in)": float(logic.THICKNESS_LIST[0]) if getattr(logic, "THICKNESS_LIST", None) else 0.25,
-                                "Use STEP weight": True,
-                                "BBox W (in)": round(float(p.get("bbox_w_in", 0.0) or 0.0), 3),
-                                "BBox L (in)": round(float(p.get("bbox_l_in", 0.0) or 0.0), 3),
-                                "BBox H (in)": round(float(p.get("bbox_h_in", 0.0) or 0.0), 3),
-                                "Volume (in^3)": round(vol_in3_p, 3),
-                                "Weight (lb)": round(wt_lbs_p, 2),
-                            }
-                        )
+            rows.append({
+                "Include": True,
+                "Source File": filename,
+                "Part Name": part_name,
+                "Row ID": row_id,
+                "Qty": 1,
+                "Material": str(logic.MATERIALS_LIST[0]),
+                "Thickness (in)": float(logic.THICKNESS_LIST[0]),
+                "Use STEP weight": True,
+                "BBox W (in)": round(bw, 3),
+                "BBox L (in)": round(bl, 3),
+                "BBox H (in)": round(bh, 3),
+                "Volume (in³)": round(vol, 3),
+                "Weight (lb)": round(wt, 2),
+            })
+            meshes_by_id[row_id] = geom
 
-                    if len(part_rows) >= 1:
-                        if len(part_rows) > 1:
-                            st.markdown("#### Assembly parts")
-                            st.caption(
-                                "This STEP contains multiple bodies. Select which ones to add to the estimate. "
-                                "Default is to use STEP-derived weight for each item (recommended)."
-                            )
-                        else:
-                            st.markdown("#### STEP part")
-                            st.caption(
-                                "Edit the fields below (qty/material/thickness) and add this STEP-derived item to the estimate."
-                            )
+    elif isinstance(scene_or_mesh, trimesh.Trimesh):
+        row_id = str(uuid.uuid4())[:8]
+        bw, bl, bh, vol, wt = mesh_metrics(scene_or_mesh)
+        part_name = os.path.splitext(filename)[0]
 
-                        df_parts = pd.DataFrame(part_rows)
+        rows.append({
+            "Include": True,
+            "Source File": filename,
+            "Part Name": part_name,
+            "Row ID": row_id,
+            "Qty": 1,
+            "Material": str(logic.MATERIALS_LIST[0]),
+            "Thickness (in)": float(logic.THICKNESS_LIST[0]),
+            "Use STEP weight": True,
+            "BBox W (in)": round(bw, 3),
+            "BBox L (in)": round(bl, 3),
+            "BBox H (in)": round(bh, 3),
+            "Volume (in³)": round(vol, 3),
+            "Weight (lb)": round(wt, 2),
+        })
+        meshes_by_id[row_id] = scene_or_mesh
+    else:
+        raise ValueError("Unsupported geometry returned from STEP loader.")
 
-                        edited_parts = st.data_editor(
-                            df_parts,
-                            use_container_width=True,
-                            num_rows="fixed",
-                            key="step_parts_editor",
-                            column_config={
-                                "Include": st.column_config.CheckboxColumn("Include", default=True),
-                                "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
-                                "Material": st.column_config.SelectboxColumn(
-                                    "Material",
-                                    options=[str(x) for x in logic.MATERIALS_LIST],
-                                    required=True,
-                                ),
-                                "Thickness (in)": st.column_config.SelectboxColumn(
-                                    "Thickness (in)",
-                                    options=[float(x) for x in logic.THICKNESS_LIST],
-                                    required=True,
-                                ),
-                                "Use STEP weight": st.column_config.CheckboxColumn("Use STEP weight", default=True),
-                            },
-                        )
+    return pd.DataFrame(rows), meshes_by_id
 
-                        add_selected = st.button("Add selected STEP parts to estimate", type="primary", key="add_selected_step_parts")
-                        if add_selected:
-                            added_n = 0
-                            for _, r in edited_parts.iterrows():
-                                try:
-                                    if not bool(r.get("Include", False)):
-                                        continue
+if step_files:
+    # Build a combined parts table across all uploaded STEP files.
+    # Each uploaded file may be a single-part STEP or an assembly; assemblies are exploded into parts.
+    import pandas as pd
 
-                                    pname = str(r.get("Part Name", "STEP Part"))
-                                    qty = int(r.get("Quantity", 1) or 1)
-                                    mat = str(r.get("Material", logic.MATERIALS_LIST[0]))
-                                    thk = float(r.get("Thickness (in)", logic.THICKNESS_LIST[0]))
+    all_rows = []
+    mesh_cache = {}  # (row_id) -> trimesh.Trimesh for optional preview
 
-                                    w_in_p = float(r.get("BBox W (in)", 0.0) or 0.0)
-                                    l_in_p = float(r.get("BBox L (in)", 0.0) or 0.0)
+    for f in step_files:
+        try:
+            parts_df, meshes_by_id = _extract_step_parts_table(
+                step_bytes=f.getvalue(),
+                filename=f.name,
+                units_label=geom_units,
+                scale=float(step_scale),
+                density_lb_in3=float(density),
+            )
+            # Merge
+            all_rows.extend(parts_df.to_dict("records"))
+            mesh_cache.update(meshes_by_id)
+        except Exception as e:
+            st.error(
+                "STEP import failed. On Streamlit Cloud you must include the dependencies "
+                "`trimesh` and `cascadio` in requirements.txt (and `plotly` for preview). Error: "
+                + str(e)
+            )
 
-                                    # Use bbox perimeter as a conservative fallback for burning time
-                                    perimeter = float(2.0 * (w_in_p + l_in_p))
+    if not all_rows:
+        st.warning("No parts found in the uploaded STEP file(s).")
+    else:
+        df_parts = pd.DataFrame(all_rows)
 
-                                    burn_machine = logic.get_plate_burn_machine_type(thk)
-                                    feedrate = logic.get_feedrate_for_thickness(thk, logic.FEEDRATE_TABLE_IPM)
-                                    burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
+        st.markdown("#### STEP parts")
+        st.caption(
+            "Select the parts you want to add to the estimate. "
+            "BBox/Volume/Weight come from STEP. Material/Thickness/Qty are editable."
+        )
 
-                                    # Default: use STEP-derived weight (recommended for non-plate solids)
-                                    step_weight_item = float(r.get("Weight (lb)", 0.0) or 0.0)
-                                    if bool(r.get("Use STEP weight", True)) and step_weight_item > 0:
-                                        net_weight_item = step_weight_item
-                                    else:
-                                        net_weight_item = logic.calculate_plate_net_weight(
-                                            thk, w_in_p, l_in_p, logic.DENSITY_FACTOR_FOR_CALCULATION
-                                        )
+        edited = st.data_editor(
+            df_parts,
+            use_container_width=True,
+            num_rows="fixed",
+            key="step_parts_editor_multi",
+            column_config={
+                "Include": st.column_config.CheckboxColumn("Include", default=True),
+                "Qty": st.column_config.NumberColumn("Qty", min_value=1, step=1, required=True),
+                "Material": st.column_config.SelectboxColumn(
+                    "Material", options=[str(x) for x in logic.MATERIALS_LIST], required=True
+                ),
+                "Thickness (in)": st.column_config.SelectboxColumn(
+                    "Thickness (in)", options=[float(x) for x in logic.THICKNESS_LIST], required=True
+                ),
+                "Use STEP weight": st.column_config.CheckboxColumn("Use STEP weight", default=True),
+                "BBox W (in)": st.column_config.NumberColumn("BBox W (in)", disabled=True),
+                "BBox L (in)": st.column_config.NumberColumn("BBox L (in)", disabled=True),
+                "BBox H (in)": st.column_config.NumberColumn("BBox H (in)", disabled=True),
+                "Volume (in³)": st.column_config.NumberColumn("Volume (in³)", disabled=True),
+                "Weight (lb)": st.column_config.NumberColumn("Weight (lb)", disabled=True),
+            },
+        )
 
-                                    gross_weight_item = logic.calculate_gross_weight(
-                                        net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT
-                                    )
-                                    fit_time_item = logic.calculate_fit_time(net_weight_item)
-
-                                    part = {
-                                        "Estimation Type": "Plate",
-                                        "Part Name": pname,
-                                        "Quantity": qty,
-                                        "Material": mat,
-                                        "Thickness (in)": float(thk),
-                                        "Width (in)": float(w_in_p),
-                                        "Length (in)": float(l_in_p),
-                                        "Bends (per item)": 0,
-                                        "Bend Complexity": "N/A",
-                                        "Burn Machine Type": burn_machine,
-                                        "Perimeter (in/item)": round(perimeter, 2),
-                                        "Feedrate (IPM)": float(feedrate),
-                                        "Drilling Time (min/item)": 0.0,
-                                        "Drill Details Summary": "",
-                                        "Burning Time (min/item)": float(burn_time_item),
-                                        "Bend Time (min/item)": 0.0,
-                                        "Net Weight (lbs/item)": round(float(net_weight_item), 2),
-                                        "Gross Weight (lbs/item)": round(float(gross_weight_item), 2),
-                                        "Fit Time (min/item)": float(fit_time_item),
-                                        "STEP Volume (in^3)": float(r.get("Volume (in^3)", 0.0) or 0.0),
-                                        "STEP Weight (lbs/item)": float(step_weight_item),
-                                        "STEP BBox H (in)": float(r.get("BBox H (in)", 0.0) or 0.0),
-                                        "STEP Source": str(step_file.name),
-
-                                        "Total Gross Weight (lbs)": round(gross_weight_item * qty, 2),
-                                        "Total Burning Run Time (min)": round(burn_time_item * qty, 2),
-                                        "Total Drilling Time (min)": 0.0,
-                                        "Total Bend Time (min)": 0.0,
-                                        "Total Rolling Run Time (min)": 0.0,
-                                        "Total Fit Time (min)": round(fit_time_item * qty, 2),
-
-                                        # Rolling fields (off by default)
-                                        "Rolling Enabled": "No",
-                                        "Rolling Type": "N/A",
-                                        "Rolling OD Bucket": "N/A",
-                                        "Rolling Prebend": "No",
-                                        "Rolling Tight Tolerance": "No",
-                                        "Rolling Time (min/item)": 0.0,
-                                        "Rolling Details": "",
-                                        "Total Rolling Run Time (min)": 0.0,
-                                    }
-
-                                    _add_part(part)
-                                    added_n += 1
-                                except Exception as e:
-                                    st.error(f"Could not add '{r.get('Part Name','')}' to estimate: {e}")
-
-                            if added_n:
-                                st.success(f"Added {added_n} part(s) from STEP assembly.")
-                                st.rerun()
-                except Exception:
-                    # If anything about assembly parsing fails, just skip this section.
-                    pass
-
-                use_vals = st.button("Use these values in Plate entry", type="primary")
-                if use_vals:
-                    st.session_state["plate_step_loaded_name"] = str(step_file.name)
-                    st.session_state["plate_step_bbox_h_in"] = float(h_in)
-                    st.session_state["plate_step_volume_in3"] = float(vol_in3)
-                    st.session_state["plate_step_weight_lbs"] = float(wt_lbs)
-
-                    # Push bbox W/L into the plate width/length fields to speed up entry
-                    st.session_state["plate_w"] = float(w_in)
-                    st.session_state["plate_l"] = float(l_in)
-
-                    # Helpful part name default
-                    if st.session_state.get("plate_part_name", "Unnamed Plate") in ("Unnamed Plate", "", None):
-                        st.session_state["plate_part_name"] = os.path.splitext(step_file.name)[0]
-
-                    st.success("Loaded STEP metrics into Plate entry fields.")
-                    st.rerun()
-
+        # Optional preview: choose a row and show its mesh
+        with st.expander("Preview a selected part (optional)", expanded=False):
+            try:
+                selectable = edited[edited["Include"] == True].copy()  # noqa: E712
+                if selectable.empty:
+                    st.info("Select at least one part (Include = true) to preview.")
+                else:
+                    labels = [
+                        f"{r['Source File']} :: {r['Part Name']} (id={r['Row ID']})"
+                        for _, r in selectable.iterrows()
+                    ]
+                    sel = st.selectbox("Choose a part to preview", options=labels, key="step_preview_select")
+                    # Parse row id from label
+                    row_id = sel.split("id=")[-1].rstrip(")")
+                    row_id = row_id.strip()
+                    mesh = mesh_cache.get(row_id)
+                    if mesh is None:
+                        st.warning("Preview mesh not available for this part.")
+                    else:
+                        fig = _mesh_preview_plotly(mesh)
+                        st.plotly_chart(fig, use_container_width=True, height=320)
             except Exception as e:
-                st.error(
-                    "STEP import failed. On Streamlit Cloud you must include the dependencies "
-                    "`trimesh` and `cascadio` in requirements.txt (and `plotly` for preview). Error: "
-                    + str(e)
-                )
+                st.warning(f"Preview failed: {e}")
 
+        add_selected = st.button("Add selected STEP parts to estimate", type="primary", key="step_add_selected_multi")
+        if add_selected:
+            added_n = 0
+            for _, r in edited.iterrows():
+                try:
+                    include = bool(r.get("Include", True))
+                    if not include:
+                        continue
 
-    # ------------------------------------------------------------
+                    qty = int(r.get("Qty", 1))
+                    material = str(r.get("Material", logic.MATERIALS_LIST[0]))
+                    thickness = float(r.get("Thickness (in)", logic.THICKNESS_LIST[0]))
+
+                    width = float(r.get("BBox W (in)", 0.0))
+                    length = float(r.get("BBox L (in)", 0.0))
+                    # Perimeter fallback (bbox rectangle)
+                    perimeter = float(2.0 * (width + length))
+
+                    burn_machine = logic.get_plate_burn_machine_type(thickness)
+                    feedrate = logic.get_feedrate_for_thickness(thickness, logic.FEEDRATE_TABLE_IPM)
+
+                    drilling_time_item = 0.0
+                    drill_summary_str = ""
+                    burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
+                    bend_time_item = 0.0
+
+                    # Default plate net weight from thickness/width/length
+                    net_weight_item = logic.calculate_plate_net_weight(
+                        thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION
+                    )
+
+                    use_step_weight = bool(r.get("Use STEP weight", True))
+                    step_weight = float(r.get("Weight (lb)", 0.0) or 0.0)
+                    step_volume = float(r.get("Volume (in³)", 0.0) or 0.0)
+                    bbox_h = float(r.get("BBox H (in)", 0.0) or 0.0)
+
+                    if use_step_weight and step_weight > 0:
+                        net_weight_item = step_weight
+
+                    gross_weight_item = logic.calculate_gross_weight(
+                        net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT
+                    )
+                    fit_time_item = logic.calculate_fit_time(net_weight_item)
+
+                    part_name = str(r.get("Part Name", "STEP Part"))
+                    source_file = str(r.get("Source File", ""))
+
+                    part = {
+                        "Estimation Type": "Plate",
+                        "Part Name": part_name,
+                        "Quantity": qty,
+                        "Material": material,
+                        "Thickness (in)": thickness,
+                        "Width (in)": width,
+                        "Length (in)": length,
+                        "Bends (per item)": 0,
+                        "Bend Complexity": "N/A",
+                        "Burn Machine Type": burn_machine,
+                        "Perimeter (in/item)": round(perimeter, 2),
+                        "Feedrate (IPM)": float(feedrate),
+                        "Drilling Time (min/item)": float(drilling_time_item),
+                        "Drill Details Summary": drill_summary_str,
+                        "Burning Time (min/item)": float(burn_time_item),
+                        "Bend Time (min/item)": float(bend_time_item),
+                        "Net Weight (lbs/item)": round(net_weight_item, 2),
+                        "Gross Weight (lbs/item)": round(gross_weight_item, 2),
+                        "Fit Time (min/item)": float(fit_time_item),
+                        "STEP Volume (in^3)": step_volume,
+                        "STEP Weight (lbs/item)": step_weight,
+                        "STEP BBox H (in)": bbox_h,
+                        "STEP Source File": source_file,
+                        "Total Gross Weight (lbs)": round(gross_weight_item * qty, 2),
+                        "Total Burning Run Time (min)": round(burn_time_item * qty, 2),
+                        "Total Drilling Time (min)": 0.0,
+                        "Total Bend Time (min)": 0.0,
+                        "Total Rolling Run Time (min)": 0.0,
+                        "Total Fit Time (min)": round(fit_time_item * qty, 2),
+                    }
+                    _add_part(part)
+                    added_n += 1
+                except Exception as e:
+                    st.error(f"Could not add a selected STEP part: {e}")
+
+            if added_n:
+                st.success(f"Added {added_n} part(s) from STEP file(s).")
+                st.rerun()
+
+# ------------------------------------------------------------
     # DXF Batch Import (Plate Only)
     # ------------------------------------------------------------
     with st.expander("DXF Batch Import (Plate Only)", expanded=False):
