@@ -152,6 +152,8 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
         "Bends (per item)",
         "Bend Complexity",
         "Perimeter (in/item)",
+        "End Perimeter Both Ends (in/item)",
+        "Total End Perimeter Both Ends (in)",
         "Feedrate (IPM)",
         "Weight per Foot (lbs/ft)",
         "Cross-sectional Area (in^2)",
@@ -406,15 +408,14 @@ def _metrics(m):
         float(ext_raw[1] * factor),
         float(ext_raw[2] * factor),
     ]
+    dims_sorted = sorted(dims_in)
 
-    # Rule: smallest dimension is thickness; remaining two are width/length.
-    t_in = min(dims_in)
-    other = sorted([d for d in dims_in if d != t_in])
-    if len(other) < 2:
-        dims_sorted = sorted(dims_in)
-        t_in = dims_sorted[0]
-        other = dims_sorted[1:]
-    w_in, l_in = sorted(other[:2])  # width <= length for consistency
+    # Rule: smallest dimension is thickness.
+    t_in = float(dims_sorted[0])
+
+    # Remaining two are the "plan view" dimensions.
+    w_in = float(dims_sorted[1])
+    l_in = float(dims_sorted[2])
 
                 vol_raw = float(m.volume)
                 vol_in3 = vol_raw * (factor ** 3)
@@ -428,10 +429,21 @@ def _metrics(m):
                         vol_in3 = 0.0
 
                 wt_lb = float(vol_in3) * float(density_lb_in3)
-                return bbox_w_in, bbox_l_in, bbox_h_in, float(vol_in3), float(wt_lb)
+                return w_in, l_in, t_in, float(vol_in3), float(wt_lb)
 
             rows = []
             meshes_by_id = {}
+
+def _snap_thickness_to_list(t_in: float) -> float:
+    """Snap inferred thickness to the nearest value in logic.THICKNESS_LIST (keeps UI selectbox valid)."""
+    try:
+        opts = [float(x) for x in logic.THICKNESS_LIST]
+        if not opts:
+            return float(t_in)
+        return float(min(opts, key=lambda x: abs(x - float(t_in))))
+    except Exception:
+        return float(t_in)
+
 
             if isinstance(scene_or_mesh, trimesh.Scene):
                 for gname, geom in scene_or_mesh.geometry.items():
@@ -447,7 +459,7 @@ def _metrics(m):
                             "Row ID": row_id,
                             "Qty": 1,
                             "Material": str(logic.MATERIALS_LIST[0]),
-                            "Thickness (in)": round(bh, 4),
+                            "Thickness (in)": _snap_thickness_to_list(bh),
                             "Use STEP weight": True,
                             "BBox W (in)": round(bw, 3),
                             "BBox L (in)": round(bl, 3),
@@ -468,11 +480,11 @@ def _metrics(m):
                         "Row ID": row_id,
                         "Qty": 1,
                         "Material": str(logic.MATERIALS_LIST[0]),
-                        "Thickness (in)": round(bh, 4),
-                        "Use STEP weight": True,
-                        "BBox W (in)": round(bw, 3),
-                        "BBox L (in)": round(bl, 3),
-                        "Inferred Thickness (in)": round(bh, 4),
+                        "Thickness (in)": _snap_thickness_to_list(bh),
+                            "Use STEP weight": True,
+                            "BBox W (in)": round(bw, 3),
+                            "BBox L (in)": round(bl, 3),
+                            "Inferred Thickness (in)": round(bh, 4),
                         "Volume (in³)": round(vol, 3),
                         "Weight (lb)": round(wt, 2),
                     }
@@ -516,7 +528,7 @@ def _metrics(m):
                 st.markdown("#### STEP parts")
                 st.caption(
                     "Select the parts you want to add to the estimate. "
-                    "BBox/Volume/Weight are extracted from STEP. Material/Thickness/Qty are editable."
+                    "BBox/Volume/Weight are extracted from STEP. Smallest bbox dimension is treated as thickness; the other two are width/length. Material/Thickness/Qty are editable."
                 )
 
                 edited = st.data_editor(
@@ -724,7 +736,7 @@ def _metrics(m):
                             "True Cut Perimeter (in)": float(part.cut_perimeter_in),
                             "Hole Count": int(part.hole_count),
                             "Total Hole Circumference (in)": float(part.hole_circumference_in),
-                            "Thickness (in)": round(bh, 4),
+                            "Thickness (in)": _snap_thickness_to_list(bh),
                             "Grade": str(logic.MATERIALS_LIST[0]),
                             "Quantity": 1,
                         }
@@ -860,7 +872,7 @@ def _metrics(m):
                 f"STEP loaded: {st.session_state.get('plate_step_loaded_name')} | "
                 f"Volume: {st.session_state.get('plate_step_volume_in3', 0.0):.3f} in³ | "
                 f"Weight: {st.session_state.get('plate_step_weight_lbs', 0.0):.2f} lb | "
-                f"BBox H: {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
+                f"Thickness (inferred): {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
             )
 
         st.markdown("#### Drilling (optional)")
@@ -995,6 +1007,8 @@ def page_structural() -> None:
         props = logic.AISC_LABEL_TO_PROPERTIES_MAP.get(shape_label, {})
         weight_per_foot = float(props.get("W_float", 0.0))
         area_sq_in = float(props.get("A_float", 0.0))
+        end_perim_one = logic.calculate_structural_end_perimeter(props)
+        end_perim_both = 2.0 * float(end_perim_one)
 
         net_wt = logic.calculate_structural_piece_weight(weight_per_foot, length_in)
         gross_wt = logic.calculate_gross_weight(net_wt, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
@@ -1013,6 +1027,8 @@ def page_structural() -> None:
             "Shape Label": shape_label,
             "Length (in)": float(length_in),
             "Mitered Cut": "Yes" if is_mitered else "No",
+            "End Perimeter Both Ends (in/item)": round(end_perim_both, 2),
+            "Total End Perimeter Both Ends (in)": round(end_perim_both * quantity, 2),
             "Weight per Foot (lbs/ft)": weight_per_foot,
             "Cross-sectional Area (in^2)": area_sq_in,
             "Net Weight (lbs/item)": round(net_wt, 2),
@@ -1106,6 +1122,7 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     weld_time_hr = 0.0
     weld_wire_lbs = 0.0
     perimeter_total_in = 0.0
+    structural_end_perimeter_total_in = 0.0
 
     has_plate = any(r.get("Estimation Type") == "Plate" for r in rows)
     has_struct = any(r.get("Estimation Type") == "Structural" for r in rows)
@@ -1131,6 +1148,7 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 kinetic_burn_t += float(r.get("Total Burning Time (min)", 0.0) or 0.0)
         elif etype == "Structural":
             struct_wt += float(r.get("Total Gross Weight (lbs)", 0.0) or 0.0)
+            structural_end_perimeter_total_in += float(r.get("Total End Perimeter Both Ends (in)", 0.0) or 0.0)
             str_cut_t += float(r.get("Total Cutting Time (min)", 0.0) or 0.0)
         elif etype == "Welding":
             weld_time_hr += float(r.get("Total Weld Time (hours)", 0.0) or 0.0)
@@ -1151,6 +1169,8 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "grand_total_weld_time_hours": weld_time_hr,
         "grand_total_weld_wire_lbs": weld_wire_lbs,
         "grand_total_perimeter_in": perimeter_total_in,
+        "grand_total_structural_end_perimeter_in": structural_end_perimeter_total_in,
+        "grand_total_combined_perimeter_in": perimeter_total_in + structural_end_perimeter_total_in,
         "combined_overall_gross_weight": plate_wt + struct_wt,
         "has_plate_entries": has_plate,
         "has_structural_entries": has_struct,
@@ -1171,7 +1191,13 @@ def page_summary() -> None:
     c1.metric("Total gross weight (lbs)", f"{totals['combined_overall_gross_weight']:.2f}")
     c2.metric("Total fit time (min)", f"{totals['grand_total_fit_time']:.2f}")
     c3.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
-    c4.metric("Total perimeter (in)", f"{totals['grand_total_perimeter_in']:.2f}")
+    c4.metric("Plate perimeter (in)", f"{totals['grand_total_perimeter_in']:.2f}")
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Structural end perimeter (in)", f"{totals.get('grand_total_structural_end_perimeter_in', 0.0):.2f}")
+    p2.metric("Combined perimeter (in)", f"{totals.get('grand_total_combined_perimeter_in', totals['grand_total_perimeter_in']):.2f}")
+    p3.metric("Total plate weight (lbs)", f"{totals['plate_total_gross_weight']:.2f}")
+    p4.metric("Total structural weight (lbs)", f"{totals['structural_total_gross_weight']:.2f}")
 
     # Time breakdown (requested): Saw / Laser / Kinetic
     t1, t2, t3 = st.columns(3)
@@ -1188,7 +1214,9 @@ def page_summary() -> None:
                 "Plate bend (min)": round(totals["grand_total_plate_bend_time"], 2),
                 "Saw time (min)": round(totals.get("grand_total_saw_time", totals.get("grand_total_structural_cutting_time", 0.0)), 2),
                 "Weld wire (lbs)": round(totals["grand_total_weld_wire_lbs"], 2),
-                "Total perimeter (in)": round(totals["grand_total_perimeter_in"], 2),
+                "Plate perimeter (in)": round(totals["grand_total_perimeter_in"], 2),
+                "Structural end perimeter (in)": round(totals.get("grand_total_structural_end_perimeter_in", 0.0), 2),
+                "Combined perimeter (in)": round(totals.get("grand_total_combined_perimeter_in", totals["grand_total_perimeter_in"]), 2),
             }
         )
 
