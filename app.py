@@ -40,15 +40,10 @@ def _init_state() -> None:
     st.session_state.setdefault("plate_step_loaded_name", "")
 
 
-
 def _get_password_from_secrets_or_env() -> str:
     """Return app password from Streamlit secrets (preferred) or env var as fallback."""
-    # Preferred: Streamlit secrets
-    #   [auth]
-    #   password = "..."
     if "auth" in st.secrets and "password" in st.secrets["auth"]:
         return str(st.secrets["auth"]["password"])
-    # Fallback for local dev only
     return os.getenv("ESTIMATOR_APP_PASSWORD", "")
 
 
@@ -56,7 +51,6 @@ def require_auth() -> None:
     """Gate the app behind a password (if configured)."""
     password = _get_password_from_secrets_or_env()
 
-    # If no password is configured, run unlocked.
     if not password:
         st.session_state["authenticated"] = True
         return
@@ -134,7 +128,6 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     if not rows:
         return b""
 
-    # Build stable header order (match your Flask export ordering as much as possible)
     preferred_order = [
         "Estimation Type",
         "Part Name",
@@ -190,7 +183,10 @@ def page_plate() -> None:
 
     # ------------------------------------------------------------
     # 3D STEP Import (BBOX / Volume / Weight) — Streamlit Cloud friendly
-    # Requires dependencies: trimesh + cascadio (see notes in README/requirements)
+    # Requires dependencies: trimesh + cascadio
+    #
+    # FIX: cascadio/trimesh commonly return geometry in METERS.
+    #      Your previous code treated it as mm/in, causing tiny bbox & near-zero volume.
     # ------------------------------------------------------------
     with st.expander("3D STEP Import (BBOX / Volume / Weight)", expanded=False):
         st.caption(
@@ -198,9 +194,17 @@ def page_plate() -> None:
             "We convert to a mesh under the hood and compute weight from volume using a density."
         )
 
-        u1, u2, u3 = st.columns([1, 1, 2])
+        u1, u2, u3 = st.columns([1.2, 1, 2])
         with u1:
-            step_units = st.selectbox("STEP units", options=["mm", "in"], index=0)
+            geom_units = st.selectbox(
+                "Imported geometry units",
+                options=["meters (recommended)", "millimeters", "inches"],
+                index=0,
+                help=(
+                    "Most STEP loads on Streamlit Cloud via trimesh+cascadio come in meters. "
+                    "If your bbox/volume looks off by a huge factor, try switching this."
+                ),
+            )
         with u2:
             step_scale = st.number_input(
                 "Scale multiplier",
@@ -218,18 +222,26 @@ def page_plate() -> None:
                 help="Steel is ~0.283 lb/in³. Stainless is ~0.289 lb/in³.",
             )
 
-        step_file = st.file_uploader("Upload STEP (.step/.stp)", type=["step", "stp", "STEP", "STP"], accept_multiple_files=False)
+        step_file = st.file_uploader(
+            "Upload STEP (.step/.stp)",
+            type=["step", "stp", "STEP", "STP"],
+            accept_multiple_files=False,
+        )
 
-        def _load_step_metrics(step_bytes: bytes, units: str, scale: float) -> Dict[str, float]:
-            # Lazy imports so the rest of the app still loads if deps are missing
-            import numpy as np
+        def _units_to_inches_factor(units_label: str) -> float:
+            """Convert the *imported mesh units* to inches."""
+            label = (units_label or "").lower()
+            if "meter" in label:
+                return 39.37007874015748  # m -> in
+            if "millimeter" in label or label == "mm":
+                return 1.0 / 25.4  # mm -> in
+            return 1.0  # inches
+
+        def _load_step_metrics(step_bytes: bytes, units_label: str, scale: float) -> Dict[str, float]:
             import trimesh
 
-            # trimesh uses cascadio to load STEP (OpenCASCADE packaged wheels)
-            # If cascadio isn't installed, this will throw an ImportError.
             scene_or_mesh = trimesh.load(file_obj=io.BytesIO(step_bytes), file_type="step")
 
-            # Normalize into a single mesh in world coordinates
             meshes = []
             if isinstance(scene_or_mesh, trimesh.Scene):
                 for geom in scene_or_mesh.geometry.values():
@@ -243,43 +255,44 @@ def page_plate() -> None:
             else:
                 raise ValueError("Unsupported geometry returned from STEP loader.")
 
-            # Units conversion to inches
-            # If STEP is mm, convert mm -> in; if inches, keep.
-            unit_factor = 1.0
-            if str(units).lower() == "mm":
-                unit_factor = 1.0 / 25.4
+            # Convert mesh units -> inches, then apply user scale.
+            to_in = _units_to_inches_factor(units_label)
+            factor = float(to_in) * float(scale)
 
-            factor = unit_factor * float(scale)
+            # Use mesh.extents for bbox; it’s faster and robust.
+            ext_raw = mesh.extents  # in "imported units"
+            bbox_w_in = float(ext_raw[0] * factor)
+            bbox_l_in = float(ext_raw[1] * factor)
+            bbox_h_in = float(ext_raw[2] * factor)
 
-            verts = mesh.vertices * factor
-            vmin = verts.min(axis=0)
-            vmax = verts.max(axis=0)
-            ext = vmax - vmin
+            # Volume scales by factor^3
+            vol_raw = float(mesh.volume)  # in "imported units^3" (often m^3 if imported in meters)
+            vol_in3 = vol_raw * (factor ** 3)
 
-            # Volume (in^3)
-            # If mesh isn't watertight, volume can be zero/invalid. We fall back to convex hull volume.
-            vol = float(mesh.volume) * (factor ** 3)
-            if not (vol > 0):
+            # If mesh isn't watertight, trimesh volume can be 0. Fall back to convex hull volume.
+            if not (vol_in3 > 0):
                 try:
-                    vol = float(mesh.convex_hull.volume) * (factor ** 3)
+                    vol_raw = float(mesh.convex_hull.volume)
+                    vol_in3 = vol_raw * (factor ** 3)
                 except Exception:
-                    vol = 0.0
+                    vol_in3 = 0.0
 
             return {
-                "bbox_w_in": float(ext[0]),
-                "bbox_l_in": float(ext[1]),
-                "bbox_h_in": float(ext[2]),
-                "volume_in3": float(vol),
+                "bbox_w_in": bbox_w_in,
+                "bbox_l_in": bbox_l_in,
+                "bbox_h_in": bbox_h_in,
+                "volume_in3": float(vol_in3),
             }
 
         if step_file is not None:
             try:
-                metrics = _load_step_metrics(step_file.getvalue(), step_units, float(step_scale))
+                metrics = _load_step_metrics(step_file.getvalue(), geom_units, float(step_scale))
                 w_in = metrics["bbox_w_in"]
                 l_in = metrics["bbox_l_in"]
                 h_in = metrics["bbox_h_in"]
                 vol_in3 = metrics["volume_in3"]
-                wt_lbs = vol_in3 * float(density)
+
+                wt_lbs = float(vol_in3) * float(density)
 
                 st.write(
                     {
@@ -299,11 +312,9 @@ def page_plate() -> None:
                     st.session_state["plate_step_volume_in3"] = float(vol_in3)
                     st.session_state["plate_step_weight_lbs"] = float(wt_lbs)
 
-                    # Push bbox W/L into the plate width/length fields to speed up entry
                     st.session_state["plate_w"] = float(w_in)
                     st.session_state["plate_l"] = float(l_in)
 
-                    # Helpful part name default
                     if st.session_state.get("plate_part_name", "Unnamed Plate") in ("Unnamed Plate", "", None):
                         st.session_state["plate_part_name"] = os.path.splitext(step_file.name)[0]
 
@@ -316,7 +327,6 @@ def page_plate() -> None:
                     "`trimesh` and `cascadio` in requirements.txt. Error: "
                     + str(e)
                 )
-
 
     # ------------------------------------------------------------
     # DXF Batch Import (Plate Only)
@@ -455,13 +465,14 @@ def page_plate() -> None:
                             drill_summary_str = ""
                             burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
 
-                            # No bends from DXF import (plate-only); user can edit later if desired.
                             bend_time_item = 0.0
 
                             net_weight_item = logic.calculate_plate_net_weight(
                                 thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION
                             )
-                            gross_weight_item = logic.calculate_gross_weight(net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
+                            gross_weight_item = logic.calculate_gross_weight(
+                                net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT
+                            )
                             fit_time_item = logic.calculate_fit_time(net_weight_item)
 
                             part = {
@@ -484,15 +495,14 @@ def page_plate() -> None:
                                 "Net Weight (lbs/item)": round(net_weight_item, 2),
                                 "Gross Weight (lbs/item)": round(gross_weight_item, 2),
                                 "Fit Time (min/item)": float(fit_time_item),
-            "STEP Volume (in^3)": float(st.session_state.get("plate_step_volume_in3", 0.0) or 0.0),
-            "STEP Weight (lbs/item)": float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0),
-            "STEP BBox H (in)": float(st.session_state.get("plate_step_bbox_h_in", 0.0) or 0.0),
+                                "STEP Volume (in^3)": float(st.session_state.get("plate_step_volume_in3", 0.0) or 0.0),
+                                "STEP Weight (lbs/item)": float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0),
+                                "STEP BBox H (in)": float(st.session_state.get("plate_step_bbox_h_in", 0.0) or 0.0),
                                 "Total Gross Weight (lbs)": round(gross_weight_item * quantity, 2),
                                 "Total Burning Time (min)": round(burn_time_item * quantity, 2),
                                 "Total Drilling Time (min)": round(drilling_time_item * quantity, 2),
                                 "Total Bend Time (min)": round(bend_time_item * quantity, 2),
                                 "Total Fit Time (min)": round(fit_time_item * quantity, 2),
-                                # DXF metrics (kept for transparency)
                                 "DXF Source": str(r.get("Source DXF", "")),
                                 "DXF Hole Count": int(r.get("Hole Count", 0)),
                                 "DXF Total Hole Circumference (in)": float(r.get("Total Hole Circumference (in)", 0.0)),
@@ -507,24 +517,47 @@ def page_plate() -> None:
                         st.success(f"Added {added_n} plate part(s) from DXF.")
                         st.rerun()
             else:
-                st.warning("No closed profiles were detected in the uploaded DXFs (or everything was filtered out by ignored layers).")
+                st.warning(
+                    "No closed profiles were detected in the uploaded DXFs (or everything was filtered out by ignored layers)."
+                )
 
     with st.form("plate_form"):
         c1, c2 = st.columns(2)
         with c1:
-            part_name = st.text_input("Part name", value=st.session_state.get("plate_part_name", "Unnamed Plate"), key="plate_part_name")
-            quantity = st.number_input("Quantity", min_value=1, value=int(st.session_state.get("plate_qty", 1)), step=1, key="plate_qty")
+            part_name = st.text_input(
+                "Part name",
+                value=st.session_state.get("plate_part_name", "Unnamed Plate"),
+                key="plate_part_name",
+            )
+            quantity = st.number_input(
+                "Quantity",
+                min_value=1,
+                value=int(st.session_state.get("plate_qty", 1)),
+                step=1,
+                key="plate_qty",
+            )
             material = st.selectbox("Material", options=logic.MATERIALS_LIST, index=0, key="plate_mat")
             thickness = st.selectbox("Thickness (in)", options=logic.THICKNESS_LIST, index=0, key="plate_thk")
         with c2:
-            width = st.number_input("Width (in)", min_value=0.0, value=float(st.session_state.get("plate_w", 0.0)), step=0.25, key="plate_w")
-            length = st.number_input("Length (in)", min_value=0.0, value=float(st.session_state.get("plate_l", 0.0)), step=0.25, key="plate_l")
+            width = st.number_input(
+                "Width (in)",
+                min_value=0.0,
+                value=float(st.session_state.get("plate_w", 0.0)),
+                step=0.25,
+                key="plate_w",
+            )
+            length = st.number_input(
+                "Length (in)",
+                min_value=0.0,
+                value=float(st.session_state.get("plate_l", 0.0)),
+                step=0.25,
+                key="plate_l",
+            )
             num_bends = st.number_input("Bends (per item)", min_value=0, value=0, step=1)
             bend_complexity = st.selectbox("Bend complexity", options=["N/A"] + logic.BEND_COMPLEXITY_OPTIONS, index=0)
             if num_bends == 0:
                 bend_complexity = "N/A"
 
-        # If STEP was loaded, show the metrics so the estimator can use them for sanity-checks
         if st.session_state.get("plate_step_loaded_name"):
             st.info(
                 f"STEP loaded: {st.session_state.get('plate_step_loaded_name')} | "
@@ -536,14 +569,14 @@ def page_plate() -> None:
         st.markdown("#### Drilling (optional)")
         d1, d2, d3 = st.columns(3)
         with d1:
-            hole_dia_1 = st.number_input('Hole 1 dia (in)', min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_1 = st.number_input('Hole 1 qty', min_value=0, value=0, step=1)
+            hole_dia_1 = st.number_input("Hole 1 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+            hole_qty_1 = st.number_input("Hole 1 qty", min_value=0, value=0, step=1)
         with d2:
-            hole_dia_2 = st.number_input('Hole 2 dia (in)', min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_2 = st.number_input('Hole 2 qty', min_value=0, value=0, step=1)
+            hole_dia_2 = st.number_input("Hole 2 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+            hole_qty_2 = st.number_input("Hole 2 qty", min_value=0, value=0, step=1)
         with d3:
-            hole_dia_3 = st.number_input('Hole 3 dia (in)', min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_3 = st.number_input('Hole 3 qty', min_value=0, value=0, step=1)
+            hole_dia_3 = st.number_input("Hole 3 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+            hole_qty_3 = st.number_input("Hole 3 qty", min_value=0, value=0, step=1)
 
         st.markdown("#### STEP Weight (optional)")
         use_step_weight = st.checkbox(
@@ -555,7 +588,6 @@ def page_plate() -> None:
         add = st.form_submit_button("Add plate to estimate")
 
     if add:
-        # Build a form-like dict for existing logic
         fake_form = {
             "hole_dia_1": hole_dia_1,
             "hole_qty_1": hole_qty_1,
@@ -570,13 +602,16 @@ def page_plate() -> None:
         feedrate = logic.get_feedrate_for_thickness(thickness, logic.FEEDRATE_TABLE_IPM)
         drilling_time_item, drill_summary_str = logic.process_plate_drilling_data(fake_form, thickness)
         burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
-        bend_time_item = round(logic.calculate_bend_time(int(num_bends), bend_complexity, logic.BEND_TIME_PER_COMPLEXITY_MINUTES), 2)
+        bend_time_item = round(
+            logic.calculate_bend_time(int(num_bends), bend_complexity, logic.BEND_TIME_PER_COMPLEXITY_MINUTES), 2
+        )
         net_weight_item = logic.calculate_plate_net_weight(thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION)
-        # If STEP-derived weight is available, optionally override net weight for fit time + reporting
-        if 'use_step_weight' in locals() and use_step_weight:
+
+        if "use_step_weight" in locals() and use_step_weight:
             step_wt = float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0)
             if step_wt > 0:
                 net_weight_item = step_wt
+
         gross_weight_item = logic.calculate_gross_weight(net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
         fit_time_item = logic.calculate_fit_time(net_weight_item)
 
@@ -621,21 +656,10 @@ def page_structural() -> None:
 
     structural_types = sorted(list(logic.AISC_TYPES_TO_LABELS_MAP.keys()))
 
-    # NOTE: We intentionally do NOT wrap these widgets in a st.form.
-    # Streamlit forms do not rerun the script on widget changes, which breaks
-    # dependent dropdowns (Type -> Shape). Keeping them outside the form ensures
-    # the Shape list updates immediately when Type changes.
-
-    # Streamlit can sometimes keep the previous selectbox value even when
-    # the options list changes (especially with very large lists).
-    # To make the dependent dropdown rock-solid, we give the Shape widget a
-    # *type-specific key* so it remounts whenever Type changes.
-
     def _cleanup_old_shape_keys(current_type: str) -> None:
         prefix = "struct_shape_"
         for k in list(st.session_state.keys()):
             if k.startswith(prefix) and k != f"{prefix}{current_type}":
-                # keep state tidy; not strictly required
                 del st.session_state[k]
 
     c1, c2 = st.columns(2)
@@ -652,7 +676,6 @@ def page_structural() -> None:
         _cleanup_old_shape_keys(structural_type)
 
         shape_key = f"struct_shape_{structural_type}"
-        # Ensure there is a valid default for this Type.
         if labels and shape_key not in st.session_state:
             st.session_state[shape_key] = labels[0]
         shape_label = st.selectbox("Shape", options=labels, key=shape_key)
@@ -692,7 +715,6 @@ def page_structural() -> None:
             "Total Gross Weight (lbs)": round(gross_wt * quantity, 2),
             "Total Cutting Time (min)": round(cut_t * quantity, 2),
             "Total Fit Time (min)": round(fit_t * quantity, 2),
-            # Keep these so totals logic is simpler
             "Burn Machine Type": "N/A",
             "Burning Time (min/item)": 0.0,
             "Total Burning Time (min)": 0.0,
@@ -717,12 +739,13 @@ def page_welding() -> None:
         cjp_count = 0
 
         for i in range(1, 11):
-            # (Most users only need a handful; increase to 50 if you want, but 10 is cleaner UI.)
             cols = st.columns([2, 2, 1, 1])
             with cols[0]:
                 size = st.selectbox(f"Weld size #{i}", options=[""] + logic.WELD_SIZE_OPTIONS, key=f"wsize_{i}")
             with cols[1]:
-                length = st.number_input(f"Length (in) #{i}", min_value=0.0, value=0.0, step=1.0, key=f"wlen_{i}")
+                length = st.number_input(
+                    f"Length (in) #{i}", min_value=0.0, value=0.0, step=1.0, key=f"wlen_{i}"
+                )
             with cols[2]:
                 preheat = st.checkbox("Preheat", key=f"wpre_{i}")
             with cols[3]:
@@ -751,7 +774,6 @@ def page_welding() -> None:
             "Weld Details Summary": weld_details_summary,
             "Total Weld Wire (lbs)": total_wire_weight,
             "Total Weld Time (hours)": total_time_hours,
-            # Keep totals keys consistent
             "Total Gross Weight (lbs)": 0.0,
             "Total Burning Time (min)": 0.0,
             "Total Drilling Time (min)": 0.0,
@@ -767,7 +789,6 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     plate_wt = 0.0
     struct_wt = 0.0
     plt_bend_t = 0.0
-    # Structural cutting time is treated as "saw" time in the UI totals.
     str_cut_t = 0.0
     fit_t = 0.0
     laser_burn_t = 0.0
@@ -783,13 +804,13 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     for r in rows:
         fit_t += float(r.get("Total Fit Time (min)", 0.0) or 0.0)
 
-        # Perimeter is stored as inches per item; multiply by quantity where available.
         try:
             per_item = float(r.get("Perimeter (in/item)", 0.0) or 0.0)
             qty = int(r.get("Quantity", 0) or 0)
             perimeter_total_in += per_item * qty
         except Exception:
             pass
+
         etype = r.get("Estimation Type")
         if etype == "Plate":
             plate_wt += float(r.get("Total Gross Weight (lbs)", 0.0) or 0.0)
@@ -813,9 +834,7 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "grand_total_kinetic_burn_time": kinetic_burn_t,
         "grand_total_plate_drilling_time": drill_t,
         "grand_total_plate_bend_time": plt_bend_t,
-        # Back-compat key (older UI label)
         "grand_total_structural_cutting_time": str_cut_t,
-        # Preferred key (explicit)
         "grand_total_saw_time": str_cut_t,
         "grand_total_fit_time": fit_t,
         "grand_total_weld_time_hours": weld_time_hr,
@@ -836,14 +855,12 @@ def page_summary() -> None:
 
     totals = _compute_totals(rows)
 
-    # Primary headline totals
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total gross weight (lbs)", f"{totals['combined_overall_gross_weight']:.2f}")
     c2.metric("Total fit time (min)", f"{totals['grand_total_fit_time']:.2f}")
     c3.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
     c4.metric("Total perimeter (in)", f"{totals['grand_total_perimeter_in']:.2f}")
 
-    # Time breakdown (requested): Saw / Laser / Kinetic
     t1, t2, t3 = st.columns(3)
     t1.metric("Saw time (min)", f"{totals.get('grand_total_saw_time', totals.get('grand_total_structural_cutting_time', 0.0)):.2f}")
     t2.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
@@ -874,10 +891,8 @@ def page_summary() -> None:
 
     st.divider()
 
-    # ---- Plate yield ----
     if totals["has_plate_entries"]:
         st.subheader("Plate yield")
-        # Group plates by thickness + material
         grouped = {}
         for r in rows:
             if r.get("Estimation Type") != "Plate":
@@ -922,7 +937,6 @@ def page_summary() -> None:
                 }
             st.session_state["plate_yield_results"] = results
 
-        # Display saved results
         if st.session_state["plate_yield_results"]:
             for key, res in st.session_state["plate_yield_results"].items():
                 st.markdown(f"**{key}**")
@@ -937,10 +951,8 @@ def page_summary() -> None:
                 for i, layout in enumerate(res.get("layouts", []), start=1):
                     st.image(_create_yield_image(layout), caption=f"Sheet {i}")
 
-    # ---- Structural yield ----
     if totals["has_structural_entries"]:
         st.subheader("Structural yield")
-        # Group by shape label
         grouped_struct = {}
         for r in rows:
             if r.get("Estimation Type") != "Structural":
@@ -1039,7 +1051,6 @@ def main() -> None:
     _init_state()
     require_auth()
 
-    # Load AISC DB
     ok = _load_aisc_once(logic.AISC_CSV_FILENAME)
     if not ok:
         st.warning("AISC database could not be loaded. Structural tab will not work until the CSV is present.")
