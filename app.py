@@ -400,22 +400,11 @@ def page_plate() -> None:
             to_in = _units_to_inches_factor(units_label)
             factor = float(to_in) * float(scale)
 
-            
-def _metrics(m):
-    ext_raw = m.extents
-    dims_in = [
-        float(ext_raw[0] * factor),
-        float(ext_raw[1] * factor),
-        float(ext_raw[2] * factor),
-    ]
-    dims_sorted = sorted(dims_in)
-
-    # Rule: smallest dimension is thickness.
-    t_in = float(dims_sorted[0])
-
-    # Remaining two are the "plan view" dimensions.
-    w_in = float(dims_sorted[1])
-    l_in = float(dims_sorted[2])
+            def _metrics(m):
+                ext_raw = m.extents
+                bbox_w_in = float(ext_raw[0] * factor)
+                bbox_l_in = float(ext_raw[1] * factor)
+                bbox_h_in = float(ext_raw[2] * factor)
 
                 vol_raw = float(m.volume)
                 vol_in3 = vol_raw * (factor ** 3)
@@ -429,21 +418,10 @@ def _metrics(m):
                         vol_in3 = 0.0
 
                 wt_lb = float(vol_in3) * float(density_lb_in3)
-                return w_in, l_in, t_in, float(vol_in3), float(wt_lb)
+                return bbox_w_in, bbox_l_in, bbox_h_in, float(vol_in3), float(wt_lb)
 
             rows = []
             meshes_by_id = {}
-
-def _snap_thickness_to_list(t_in: float) -> float:
-    """Snap inferred thickness to the nearest value in logic.THICKNESS_LIST (keeps UI selectbox valid)."""
-    try:
-        opts = [float(x) for x in logic.THICKNESS_LIST]
-        if not opts:
-            return float(t_in)
-        return float(min(opts, key=lambda x: abs(x - float(t_in))))
-    except Exception:
-        return float(t_in)
-
 
             if isinstance(scene_or_mesh, trimesh.Scene):
                 for gname, geom in scene_or_mesh.geometry.items():
@@ -459,11 +437,11 @@ def _snap_thickness_to_list(t_in: float) -> float:
                             "Row ID": row_id,
                             "Qty": 1,
                             "Material": str(logic.MATERIALS_LIST[0]),
-                            "Thickness (in)": _snap_thickness_to_list(bh),
+                            "Thickness (in)": float(logic.THICKNESS_LIST[0]),
                             "Use STEP weight": True,
                             "BBox W (in)": round(bw, 3),
                             "BBox L (in)": round(bl, 3),
-                            "Inferred Thickness (in)": round(bh, 4),
+                            "BBox H (in)": round(bh, 3),
                             "Volume (in³)": round(vol, 3),
                             "Weight (lb)": round(wt, 2),
                         }
@@ -480,11 +458,11 @@ def _snap_thickness_to_list(t_in: float) -> float:
                         "Row ID": row_id,
                         "Qty": 1,
                         "Material": str(logic.MATERIALS_LIST[0]),
-                        "Thickness (in)": _snap_thickness_to_list(bh),
-                            "Use STEP weight": True,
-                            "BBox W (in)": round(bw, 3),
-                            "BBox L (in)": round(bl, 3),
-                            "Inferred Thickness (in)": round(bh, 4),
+                        "Thickness (in)": float(logic.THICKNESS_LIST[0]),
+                        "Use STEP weight": True,
+                        "BBox W (in)": round(bw, 3),
+                        "BBox L (in)": round(bl, 3),
+                        "BBox H (in)": round(bh, 3),
                         "Volume (in³)": round(vol, 3),
                         "Weight (lb)": round(wt, 2),
                     }
@@ -528,7 +506,7 @@ def _snap_thickness_to_list(t_in: float) -> float:
                 st.markdown("#### STEP parts")
                 st.caption(
                     "Select the parts you want to add to the estimate. "
-                    "BBox/Volume/Weight are extracted from STEP. Smallest bbox dimension is treated as thickness; the other two are width/length. Material/Thickness/Qty are editable."
+                    "BBox/Volume/Weight are extracted from STEP. Material/Thickness/Qty are editable."
                 )
 
                 edited = st.data_editor(
@@ -548,7 +526,7 @@ def _snap_thickness_to_list(t_in: float) -> float:
                         "Use STEP weight": st.column_config.CheckboxColumn("Use STEP weight", default=True),
                         "BBox W (in)": st.column_config.NumberColumn("BBox W (in)", disabled=True),
                         "BBox L (in)": st.column_config.NumberColumn("BBox L (in)", disabled=True),
-                        "Inferred Thickness (in)": st.column_config.NumberColumn("Inferred Thickness (in)", disabled=True),
+                        "BBox H (in)": st.column_config.NumberColumn("BBox H (in)", disabled=True),
                         "Volume (in³)": st.column_config.NumberColumn("Volume (in³)", disabled=True),
                         "Weight (lb)": st.column_config.NumberColumn("Weight (lb)", disabled=True),
                         "Row ID": st.column_config.TextColumn("Row ID", disabled=True),
@@ -608,7 +586,7 @@ def _snap_thickness_to_list(t_in: float) -> float:
                             use_step_weight = bool(r.get("Use STEP weight", True))
                             step_weight = float(r.get("Weight (lb)", 0.0) or 0.0)
                             step_volume = float(r.get("Volume (in³)", 0.0) or 0.0)
-                            bbox_h = float(r.get("Inferred Thickness (in)", 0.0) or 0.0)
+                            bbox_h = float(r.get("BBox H (in)", 0.0) or 0.0)
                             source_file = str(r.get("Source File", ""))
                             part_name = str(r.get("Part Name", "STEP Part"))
 
@@ -736,7 +714,7 @@ def _snap_thickness_to_list(t_in: float) -> float:
                             "True Cut Perimeter (in)": float(part.cut_perimeter_in),
                             "Hole Count": int(part.hole_count),
                             "Total Hole Circumference (in)": float(part.hole_circumference_in),
-                            "Thickness (in)": _snap_thickness_to_list(bh),
+                            "Thickness (in)": float(logic.THICKNESS_LIST[0]),
                             "Grade": str(logic.MATERIALS_LIST[0]),
                             "Quantity": 1,
                         }
@@ -872,7 +850,7 @@ def _snap_thickness_to_list(t_in: float) -> float:
                 f"STEP loaded: {st.session_state.get('plate_step_loaded_name')} | "
                 f"Volume: {st.session_state.get('plate_step_volume_in3', 0.0):.3f} in³ | "
                 f"Weight: {st.session_state.get('plate_step_weight_lbs', 0.0):.2f} lb | "
-                f"Thickness (inferred): {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
+                f"BBox H: {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
             )
 
         st.markdown("#### Drilling (optional)")
