@@ -6,3 +6,4 @@ ezdxf
 shapely
 trimesh==4.11.1
 cascadio
+plotly
