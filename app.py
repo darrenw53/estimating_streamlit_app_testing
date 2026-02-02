@@ -15,18 +15,31 @@ from dxf_plate import parse_dxf_plate_single_part_geometry, render_part_thumbnai
 APP_TITLE = "Estimating Calculator"
 
 # ============================================================
+# NEW: Setup time rules
+#  - 0.50 hr (30 min) setup per unique (Thickness, Material) group
+#  - separate buckets:
+#       Laser setup vs Kinetic setup
+#       Rolling setup (for rolling-enabled plates only)
+# ============================================================
+SETUP_HOURS_PER_UNIQUE_THK_MAT = 0.50
+SETUP_MIN_PER_UNIQUE_THK_MAT = SETUP_HOURS_PER_UNIQUE_THK_MAT * 60.0  # 30.0
+
+
+# ============================================================
 # Rolling model (Plate -> Optional)
 # Estimated time driven primarily by part weight (calculated from plate parameters)
+# NOTE: Rolling "setup" is now handled via the unique-group setup rule above
+#       (i.e., we do NOT add per-line rolling setup minutes anymore).
 # ============================================================
 
 ROLLING_OD_BUCKETS = ["<= 24 in", "24–60 in", "60–120 in", "> 120 in"]
 
-# Base rolling labor HOURS per part by weight bucket (lbs) — matches earlier guidance (hour-based)
+# Base rolling labor HOURS per part by weight bucket (lbs)
 ROLLING_WEIGHT_BUCKETS_HR = [
-    (0.0, 100.0, 0.25),
-    (100.0, 250.0, 0.40),
-    (250.0, 500.0, 0.60),
-    (500.0, 1000.0, 0.90),
+    (0.0, 100.0, 0.50),
+    (100.0, 250.0, 0.60),
+    (250.0, 500.0, 0.80),
+    (500.0, 1000.0, 1.00),
     (1000.0, 2000.0, 1.40),
     (2000.0, 4000.0, 2.20),
     (4000.0, 8000.0, 3.20),
@@ -35,17 +48,14 @@ ROLLING_WEIGHT_BUCKETS_HR = [
 ROLLING_OVER_12000_BASE_HR = 4.25
 ROLLING_OVER_12000_PER_4000_HR = 0.60
 
-ROLLING_SETUP_MIN = {
-    "Cylinder": 30.0,
-    "Cone": 45.0,
-}
-
+# OD multipliers
 ROLLING_OD_MULT = {
     "<= 24 in": 1.30,
     "24–60 in": 1.00,
     "60–120 in": 0.95,
     "> 120 in": 0.90,
 }
+
 
 def _rolling_thickness_multiplier(thk_in: float) -> float:
     t = float(thk_in or 0.0)
@@ -56,6 +66,7 @@ def _rolling_thickness_multiplier(thk_in: float) -> float:
     if t < 1.00:
         return 1.25
     return 1.60
+
 
 ROLLING_TYPE_MULT = {"Cylinder": 1.00, "Cone": 1.40}
 ROLLING_PREBEND_MULT = 1.20
@@ -88,7 +99,11 @@ def calculate_rolling_time_minutes_per_item(
     od_bucket: str,
     prebend: bool,
     tight_tolerance: bool,
-) -> Tuple[float, float, float, str]:
+) -> Tuple[float, float, str]:
+    """
+    Returns:
+        minutes_per_item, total_multiplier, details_string
+    """
     roll_type = "Cone" if str(roll_type).lower().startswith("cone") else "Cylinder"
     base_hr = _rolling_base_hours_by_weight(weight_lbs)
 
@@ -102,7 +117,6 @@ def calculate_rolling_time_minutes_per_item(
         mult *= float(ROLLING_TOL_MULT)
 
     minutes_item = round(base_hr * mult * 60.0, 2)
-    setup_min = float(ROLLING_SETUP_MIN.get(roll_type, 30.0))
 
     details = (
         f"base={base_hr:.2f}hr @ {float(weight_lbs):.0f}lb; "
@@ -112,7 +126,7 @@ def calculate_rolling_time_minutes_per_item(
         f"prebend={'Y' if prebend else 'N'}; tol={'Y' if tight_tolerance else 'N'}; "
         f"mult={mult:.2f}"
     )
-    return minutes_item, setup_min, mult, details
+    return minutes_item, mult, details
 
 
 # ============================================================
@@ -125,10 +139,12 @@ def _init_state() -> None:
     st.session_state.setdefault("plate_yield_results", {})
     st.session_state.setdefault("structural_yield_results", {})
 
+
 def _get_password_from_secrets_or_env() -> str:
     if "auth" in st.secrets and "password" in st.secrets["auth"]:
         return str(st.secrets["auth"]["password"])
     return os.getenv("ESTIMATOR_APP_PASSWORD", "")
+
 
 def require_auth() -> None:
     password = _get_password_from_secrets_or_env()
@@ -151,6 +167,7 @@ def require_auth() -> None:
             st.error("Incorrect password")
     st.stop()
 
+
 @st.cache_data(show_spinner=False)
 def _load_aisc_once(csv_path: str) -> bool:
     logic.aisc_data_load_attempted = False
@@ -158,6 +175,7 @@ def _load_aisc_once(csv_path: str) -> bool:
     logic.AISC_LABEL_TO_PROPERTIES_MAP = None
     logic.load_aisc_database(csv_path)
     return bool(logic.AISC_TYPES_TO_LABELS_MAP)
+
 
 def _create_yield_image(sheet_layout: Dict[str, Any], scale: int = 5) -> Image.Image:
     padding = 20
@@ -189,13 +207,16 @@ def _create_yield_image(sheet_layout: Dict[str, Any], scale: int = 5) -> Image.I
             draw.text((x0 + 5, y0 + 5), f"{part['width']:.1f}x{part['height']:.1f}", fill="black", font=font)
     return img
 
+
 def _add_part(part: Dict[str, Any]) -> None:
     st.session_state["estimate_parts"].append(part)
+
 
 def _clear_estimate() -> None:
     st.session_state["estimate_parts"] = []
     st.session_state["plate_yield_results"] = {}
     st.session_state["structural_yield_results"] = {}
+
 
 def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     if not rows:
@@ -226,22 +247,23 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
         "Burning Time (min/item)",
         "Drilling Time (min/item)",
         "Bend Time (min/item)",
+        # Rolling
         "Rolling Enabled",
         "Rolling Type",
         "Rolling OD Bucket",
         "Rolling Prebend",
         "Rolling Tight Tolerance",
         "Rolling Time (min/item)",
-        "Rolling Setup (min/lot)",
         "Rolling Details",
-        "Total Rolling Time (min)",
+        "Total Rolling Run Time (min)",
+        # Totals
         "Cutting Time (min/item)",
         "Fit Time (min/item)",
         "Total Gross Weight (lbs)",
-        "Total Burning Time (min)",
+        "Total Burning Run Time (min)",
         "Total Drilling Time (min)",
         "Total Bend Time (min)",
-        "Total Rolling Time (min)",
+        "Total Rolling Run Time (min)",
         "Total Cutting Time (min)",
         "Total Fit Time (min)",
         "Total Weld Wire (lbs)",
@@ -393,7 +415,6 @@ def page_plate() -> None:
                             drilling_time_item = 0.0
                             drill_summary_str = ""
                             burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
-
                             bend_time_item = 0.0
 
                             net_weight_item = logic.calculate_plate_net_weight(
@@ -403,6 +424,11 @@ def page_plate() -> None:
                                 net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT
                             )
                             fit_time_item = logic.calculate_fit_time(net_weight_item)
+
+                            # Rolling defaults off for DXF import
+                            rolling_enabled = False
+                            roll_time_item = 0.0
+                            total_roll_run = 0.0
 
                             part = {
                                 "Estimation Type": "Plate",
@@ -424,23 +450,25 @@ def page_plate() -> None:
                                 "Net Weight (lbs/item)": round(net_weight_item, 2),
                                 "Gross Weight (lbs/item)": round(gross_weight_item, 2),
                                 "Fit Time (min/item)": float(fit_time_item),
-                                # Rolling defaults (off for DXF import)
-                                "Rolling Enabled": "No",
+
+                                # Rolling fields
+                                "Rolling Enabled": "Yes" if rolling_enabled else "No",
                                 "Rolling Type": "N/A",
                                 "Rolling OD Bucket": "N/A",
                                 "Rolling Prebend": "No",
                                 "Rolling Tight Tolerance": "No",
-                                "Rolling Time (min/item)": 0.0,
-                                "Rolling Setup (min/lot)": 0.0,
+                                "Rolling Time (min/item)": float(roll_time_item),
                                 "Rolling Details": "",
-                                "Total Rolling Time (min)": 0.0,
-                                # Totals
+                                "Total Rolling Run Time (min)": float(total_roll_run),
+
+                                # Totals (RUN ONLY — setup computed in Summary)
                                 "Total Gross Weight (lbs)": round(gross_weight_item * quantity, 2),
-                                "Total Burning Time (min)": round(burn_time_item * quantity, 2),
+                                "Total Burning Run Time (min)": round(burn_time_item * quantity, 2),
                                 "Total Drilling Time (min)": 0.0,
                                 "Total Bend Time (min)": 0.0,
-                                "Total Rolling Time (min)": 0.0,
+                                "Total Rolling Run Time (min)": 0.0,
                                 "Total Fit Time (min)": round(fit_time_item * quantity, 2),
+
                                 # DXF metrics
                                 "DXF Source": str(r.get("Source DXF", "")),
                                 "DXF Hole Count": int(r.get("Hole Count", 0)),
@@ -503,11 +531,12 @@ def page_plate() -> None:
         key="rolling_enabled",
     )
 
-    # These MUST be outside a form so they appear instantly
     roll_type = "Cylinder"
     roll_od_bucket = "24–60 in"
     roll_prebend = False
     roll_tight_tol = False
+    roll_time_item_prev = 0.0
+    roll_details_prev = ""
 
     if rolling_enabled:
         r1, r2, r3, r4 = st.columns([1.2, 1.4, 1.0, 1.2])
@@ -520,30 +549,28 @@ def page_plate() -> None:
         with r4:
             roll_tight_tol = st.checkbox("Tight tolerance", value=False, key="roll_tol")
 
-    # Optional preview of what rolling would be (helps estimator trust)
-    try:
-        net_wt_preview = logic.calculate_plate_net_weight(
-            float(thickness), float(width), float(length), logic.DENSITY_FACTOR_FOR_CALCULATION
-        )
-    except Exception:
-        net_wt_preview = 0.0
+        try:
+            net_wt_preview = logic.calculate_plate_net_weight(
+                float(thickness), float(width), float(length), logic.DENSITY_FACTOR_FOR_CALCULATION
+            )
+        except Exception:
+            net_wt_preview = 0.0
 
-    if rolling_enabled and net_wt_preview > 0:
-        roll_time_item_prev, setup_prev, mult_prev, details_prev = calculate_rolling_time_minutes_per_item(
-            weight_lbs=net_wt_preview,
-            thickness_in=float(thickness),
-            roll_type=roll_type,
-            od_bucket=roll_od_bucket,
-            prebend=bool(roll_prebend),
-            tight_tolerance=bool(roll_tight_tol),
-        )
-        st.caption(
-            f"Rolling preview (using net wt {net_wt_preview:.1f} lb): "
-            f"{roll_time_item_prev:.1f} min/item + {setup_prev:.0f} min setup. ({details_prev})"
-        )
+        if net_wt_preview > 0:
+            roll_time_item_prev, _, roll_details_prev = calculate_rolling_time_minutes_per_item(
+                weight_lbs=net_wt_preview,
+                thickness_in=float(thickness),
+                roll_type=roll_type,
+                od_bucket=roll_od_bucket,
+                prebend=bool(roll_prebend),
+                tight_tolerance=bool(roll_tight_tol),
+            )
+            st.caption(
+                f"Rolling preview (net wt {net_wt_preview:.1f} lb): {roll_time_item_prev:.1f} min/item "
+                f"(setup is handled separately: {SETUP_MIN_PER_UNIQUE_THK_MAT:.0f} min per unique THK+MAT)"
+            )
 
     add = st.button("Add plate to estimate", type="primary", key="plate_add_btn")
-
     if add:
         fake_form = {
             "hole_dia_1": hole_dia_1, "hole_qty_1": hole_qty_1,
@@ -566,7 +593,7 @@ def page_plate() -> None:
         fit_time_item = logic.calculate_fit_time(net_weight_item)
 
         if rolling_enabled:
-            roll_time_item, roll_setup_lot, roll_mult, roll_details = calculate_rolling_time_minutes_per_item(
+            roll_time_item, _, roll_details = calculate_rolling_time_minutes_per_item(
                 weight_lbs=net_weight_item,
                 thickness_in=float(thickness),
                 roll_type=roll_type,
@@ -574,12 +601,11 @@ def page_plate() -> None:
                 prebend=bool(roll_prebend),
                 tight_tolerance=bool(roll_tight_tol),
             )
-            total_roll_time = round((roll_time_item * int(quantity)) + float(roll_setup_lot), 2)
+            total_roll_run = round(roll_time_item * int(quantity), 2)
         else:
             roll_time_item = 0.0
-            roll_setup_lot = 0.0
             roll_details = ""
-            total_roll_time = 0.0
+            total_roll_run = 0.0
 
         part = {
             "Estimation Type": "Plate",
@@ -601,6 +627,7 @@ def page_plate() -> None:
             "Net Weight (lbs/item)": round(net_weight_item, 2),
             "Gross Weight (lbs/item)": round(gross_weight_item, 2),
             "Fit Time (min/item)": float(fit_time_item),
+
             # Rolling fields
             "Rolling Enabled": "Yes" if rolling_enabled else "No",
             "Rolling Type": roll_type if rolling_enabled else "N/A",
@@ -608,15 +635,15 @@ def page_plate() -> None:
             "Rolling Prebend": "Yes" if roll_prebend else "No",
             "Rolling Tight Tolerance": "Yes" if roll_tight_tol else "No",
             "Rolling Time (min/item)": float(roll_time_item),
-            "Rolling Setup (min/lot)": float(roll_setup_lot),
             "Rolling Details": roll_details,
-            "Total Rolling Time (min)": float(total_roll_time),
-            # Totals
+            "Total Rolling Run Time (min)": float(total_roll_run),
+
+            # Totals (RUN ONLY — setup computed in Summary)
             "Total Gross Weight (lbs)": round(gross_weight_item * quantity, 2),
-            "Total Burning Time (min)": round(burn_time_item * quantity, 2),
+            "Total Burning Run Time (min)": round(burn_time_item * quantity, 2),
             "Total Drilling Time (min)": round(drilling_time_item * quantity, 2),
             "Total Bend Time (min)": round(bend_time_item * quantity, 2),
-            "Total Rolling Time (min)": round(total_roll_time, 2),
+            "Total Rolling Run Time (min)": round(total_roll_run, 2),
             "Total Fit Time (min)": round(fit_time_item * quantity, 2),
         }
 
@@ -688,23 +715,23 @@ def page_structural() -> None:
             "Total Gross Weight (lbs)": round(gross_wt * quantity, 2),
             "Total Cutting Time (min)": round(cut_t * quantity, 2),
             "Total Fit Time (min)": round(fit_t * quantity, 2),
+            # Keep plate keys present for simpler exports/totals
             "Burn Machine Type": "N/A",
             "Burning Time (min/item)": 0.0,
-            "Total Burning Time (min)": 0.0,
-            "Bend Time (min/item)": 0.0,
-            "Total Bend Time (min)": 0.0,
+            "Total Burning Run Time (min)": 0.0,
             "Drilling Time (min/item)": 0.0,
             "Total Drilling Time (min)": 0.0,
-            "Drill Details Summary": "N/A",
+            "Bend Time (min/item)": 0.0,
+            "Total Bend Time (min)": 0.0,
             "Rolling Enabled": "No",
             "Rolling Type": "N/A",
             "Rolling OD Bucket": "N/A",
             "Rolling Prebend": "No",
             "Rolling Tight Tolerance": "No",
             "Rolling Time (min/item)": 0.0,
-            "Rolling Setup (min/lot)": 0.0,
             "Rolling Details": "",
-            "Total Rolling Time (min)": 0.0,
+            "Total Rolling Run Time (min)": 0.0,
+            "Drill Details Summary": "N/A",
         }
         _add_part(part)
         st.success("Structural added.")
@@ -755,10 +782,10 @@ def page_welding() -> None:
             "Total Weld Wire (lbs)": total_wire_weight,
             "Total Weld Time (hours)": total_time_hours,
             "Total Gross Weight (lbs)": 0.0,
-            "Total Burning Time (min)": 0.0,
+            "Total Burning Run Time (min)": 0.0,
             "Total Drilling Time (min)": 0.0,
             "Total Bend Time (min)": 0.0,
-            "Total Rolling Time (min)": 0.0,
+            "Total Rolling Run Time (min)": 0.0,
             "Total Cutting Time (min)": 0.0,
             "Total Fit Time (min)": 0.0,
         }
@@ -766,16 +793,61 @@ def page_welding() -> None:
         st.success("Welding summary added.")
 
 
+def _compute_setup_times(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Computes setup minutes:
+      - Laser setup: 30 min per unique (thickness, material) among Laser plate parts
+      - Kinetic setup: same but for Kinetic plate parts
+      - Rolling setup: 30 min per unique (thickness, material) among rolling-enabled plate parts
+    """
+    laser_keys = set()
+    kinetic_keys = set()
+    rolling_keys = set()
+
+    for r in rows:
+        if r.get("Estimation Type") != "Plate":
+            continue
+
+        thk = r.get("Thickness (in)", None)
+        mat = r.get("Material", None)
+        if thk is None or mat is None:
+            continue
+
+        key = (float(thk), str(mat))
+
+        bm = str(r.get("Burn Machine Type", "") or "")
+        if bm == "Laser":
+            laser_keys.add(key)
+        elif bm == "Kinetic":
+            kinetic_keys.add(key)
+
+        roll_enabled = str(r.get("Rolling Enabled", "No")).strip().lower() in ("yes", "y", "true", "1")
+        if roll_enabled:
+            rolling_keys.add(key)
+
+    return {
+        "laser_setup_min": len(laser_keys) * SETUP_MIN_PER_UNIQUE_THK_MAT,
+        "kinetic_setup_min": len(kinetic_keys) * SETUP_MIN_PER_UNIQUE_THK_MAT,
+        "rolling_setup_min": len(rolling_keys) * SETUP_MIN_PER_UNIQUE_THK_MAT,
+        "laser_setup_groups": float(len(laser_keys)),
+        "kinetic_setup_groups": float(len(kinetic_keys)),
+        "rolling_setup_groups": float(len(rolling_keys)),
+    }
+
+
 def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     plate_wt = 0.0
     struct_wt = 0.0
+
     plt_bend_t = 0.0
-    plt_roll_t = 0.0
+    plt_roll_run_t = 0.0
     str_cut_t = 0.0
     fit_t = 0.0
-    laser_burn_t = 0.0
-    kinetic_burn_t = 0.0
+
+    laser_burn_run_t = 0.0
+    kinetic_burn_run_t = 0.0
     drill_t = 0.0
+
     weld_time_hr = 0.0
     weld_wire_lbs = 0.0
     perimeter_total_in = 0.0
@@ -797,36 +869,64 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         if etype == "Plate":
             plate_wt += float(r.get("Total Gross Weight (lbs)", 0.0) or 0.0)
             plt_bend_t += float(r.get("Total Bend Time (min)", 0.0) or 0.0)
-            plt_roll_t += float(r.get("Total Rolling Time (min)", 0.0) or 0.0)
+            plt_roll_run_t += float(r.get("Total Rolling Run Time (min)", 0.0) or 0.0)
             drill_t += float(r.get("Total Drilling Time (min)", 0.0) or 0.0)
-            if r.get("Burn Machine Type") == "Laser":
-                laser_burn_t += float(r.get("Total Burning Time (min)", 0.0) or 0.0)
-            elif r.get("Burn Machine Type") == "Kinetic":
-                kinetic_burn_t += float(r.get("Total Burning Time (min)", 0.0) or 0.0)
+
+            bm = r.get("Burn Machine Type")
+            if bm == "Laser":
+                laser_burn_run_t += float(r.get("Total Burning Run Time (min)", 0.0) or 0.0)
+            elif bm == "Kinetic":
+                kinetic_burn_run_t += float(r.get("Total Burning Run Time (min)", 0.0) or 0.0)
+
         elif etype == "Structural":
             struct_wt += float(r.get("Total Gross Weight (lbs)", 0.0) or 0.0)
             str_cut_t += float(r.get("Total Cutting Time (min)", 0.0) or 0.0)
+
         elif etype == "Welding":
             weld_time_hr += float(r.get("Total Weld Time (hours)", 0.0) or 0.0)
             weld_wire_lbs += float(r.get("Total Weld Wire (lbs)", 0.0) or 0.0)
 
+    setup = _compute_setup_times(rows)
+
     return {
         "plate_total_gross_weight": plate_wt,
         "structural_total_gross_weight": struct_wt,
-        "grand_total_laser_burn_time": laser_burn_t,
-        "grand_total_kinetic_burn_time": kinetic_burn_t,
+
+        # burn run-times
+        "grand_total_laser_burn_run_time": laser_burn_run_t,
+        "grand_total_kinetic_burn_run_time": kinetic_burn_run_t,
+
+        # burn setup
+        "grand_total_laser_setup_time": setup["laser_setup_min"],
+        "grand_total_kinetic_setup_time": setup["kinetic_setup_min"],
+
+        # drill / bend / roll
         "grand_total_plate_drilling_time": drill_t,
         "grand_total_plate_bend_time": plt_bend_t,
-        "grand_total_plate_rolling_time": plt_roll_t,
+        "grand_total_plate_rolling_run_time": plt_roll_run_t,
+
+        # rolling setup
+        "grand_total_plate_rolling_setup_time": setup["rolling_setup_min"],
+
+        # structural
         "grand_total_structural_cutting_time": str_cut_t,
         "grand_total_saw_time": str_cut_t,
+
+        # fit / weld
         "grand_total_fit_time": fit_t,
         "grand_total_weld_time_hours": weld_time_hr,
         "grand_total_weld_wire_lbs": weld_wire_lbs,
+
+        # misc
         "grand_total_perimeter_in": perimeter_total_in,
         "combined_overall_gross_weight": plate_wt + struct_wt,
         "has_plate_entries": has_plate,
         "has_structural_entries": has_struct,
+
+        # group counts (helpful to sanity check)
+        "laser_setup_groups": setup["laser_setup_groups"],
+        "kinetic_setup_groups": setup["kinetic_setup_groups"],
+        "rolling_setup_groups": setup["rolling_setup_groups"],
     }
 
 
@@ -839,17 +939,36 @@ def page_summary() -> None:
 
     totals = _compute_totals(rows)
 
+    # Primary headline totals
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total gross weight (lbs)", f"{totals['combined_overall_gross_weight']:.2f}")
     c2.metric("Total fit time (min)", f"{totals['grand_total_fit_time']:.2f}")
     c3.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
     c4.metric("Total perimeter (in)", f"{totals['grand_total_perimeter_in']:.2f}")
 
+    # Time breakdown (RUN)
+    st.subheader("Time totals")
     t1, t2, t3, t4 = st.columns(4)
     t1.metric("Saw time (min)", f"{totals.get('grand_total_saw_time', totals.get('grand_total_structural_cutting_time', 0.0)):.2f}")
-    t2.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
-    t3.metric("Kinetic time (min)", f"{totals['grand_total_kinetic_burn_time']:.2f}")
-    t4.metric("Rolling time (min)", f"{totals['grand_total_plate_rolling_time']:.2f}")
+    t2.metric("Laser RUN (min)", f"{totals['grand_total_laser_burn_run_time']:.2f}")
+    t3.metric("Kinetic RUN (min)", f"{totals['grand_total_kinetic_burn_run_time']:.2f}")
+    t4.metric("Rolling RUN (min)", f"{totals['grand_total_plate_rolling_run_time']:.2f}")
+
+    # Setup breakdown (SEPARATE)
+    s1, s2, s3, _ = st.columns(4)
+    s1.metric("Laser SETUP (min)", f"{totals['grand_total_laser_setup_time']:.2f}")
+    s2.metric("Kinetic SETUP (min)", f"{totals['grand_total_kinetic_setup_time']:.2f}")
+    s3.metric("Rolling SETUP (min)", f"{totals['grand_total_plate_rolling_setup_time']:.2f}")
+
+    with st.expander("Setup group counts (sanity check)", expanded=False):
+        st.write(
+            {
+                "Laser setup groups (# unique THK+MAT)": int(totals["laser_setup_groups"]),
+                "Kinetic setup groups (# unique THK+MAT)": int(totals["kinetic_setup_groups"]),
+                "Rolling setup groups (# unique THK+MAT)": int(totals["rolling_setup_groups"]),
+                "Setup minutes per group": float(SETUP_MIN_PER_UNIQUE_THK_MAT),
+            }
+        )
 
     st.dataframe(rows, use_container_width=True)
 
