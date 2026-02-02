@@ -1,0 +1,9 @@
+streamlit>=1.36
+pillow
+pandas
+numpy
+ezdxf
+shapely
+trimesh==4.11.1
+cascadio
+plotly
