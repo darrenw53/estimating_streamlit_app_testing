@@ -432,12 +432,18 @@ def page_plate() -> None:
                             }
                         )
 
-                    if len(part_rows) > 1:
-                        st.markdown("#### Assembly parts")
-                        st.caption(
-                            "This STEP contains multiple bodies. Select which ones to add to the estimate. "
-                            "Default is to use STEP-derived weight for each item (recommended)."
-                        )
+                    if len(part_rows) >= 1:
+                        if len(part_rows) > 1:
+                            st.markdown("#### Assembly parts")
+                            st.caption(
+                                "This STEP contains multiple bodies. Select which ones to add to the estimate. "
+                                "Default is to use STEP-derived weight for each item (recommended)."
+                            )
+                        else:
+                            st.markdown("#### STEP part")
+                            st.caption(
+                                "Edit the fields below (qty/material/thickness) and add this STEP-derived item to the estimate."
+                            )
 
                         df_parts = pd.DataFrame(part_rows)
 
@@ -445,6 +451,7 @@ def page_plate() -> None:
                             df_parts,
                             use_container_width=True,
                             num_rows="fixed",
+                            key="step_parts_editor",
                             column_config={
                                 "Include": st.column_config.CheckboxColumn("Include", default=True),
                                 "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
@@ -462,7 +469,7 @@ def page_plate() -> None:
                             },
                         )
 
-                        add_selected = st.button("Add selected assembly parts to estimate", type="primary")
+                        add_selected = st.button("Add selected STEP parts to estimate", type="primary", key="add_selected_step_parts")
                         if add_selected:
                             added_n = 0
                             for _, r in edited_parts.iterrows():
