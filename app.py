@@ -198,9 +198,17 @@ def page_plate() -> None:
             "We convert to a mesh under the hood and compute weight from volume using a density."
         )
 
-        u1, u2, u3 = st.columns([1, 1, 2])
+        u1, u2, u3 = st.columns([1.2, 1, 2])
         with u1:
-            step_units = st.selectbox("STEP units", options=["mm", "in"], index=0)
+            geom_units = st.selectbox(
+                "Imported geometry units",
+                options=["meters (recommended)", "millimeters", "inches"],
+                index=0,
+                help=(
+                    "Most STEP loads via trimesh+cascadio come in meters. "
+                    "If your bbox/volume looks way off, try switching this."
+                ),
+            )
         with u2:
             step_scale = st.number_input(
                 "Scale multiplier",
@@ -220,7 +228,64 @@ def page_plate() -> None:
 
         step_file = st.file_uploader("Upload STEP (.step/.stp)", type=["step", "stp", "STEP", "STP"], accept_multiple_files=False)
 
-        def _load_step_metrics(step_bytes: bytes, units: str, scale: float) -> Dict[str, float]:
+
+        def _units_to_inches_factor(units_label: str) -> float:
+            label = (units_label or "").lower()
+            if "meter" in label:
+                return 39.37007874015748  # m -> in
+            if "millimeter" in label or label == "mm":
+                return 1.0 / 25.4  # mm -> in
+            return 1.0  # inches
+
+        def _mesh_preview_plotly(mesh, max_faces: int = 8000):
+            """
+            Build an interactive Plotly Mesh3d preview from a trimesh.Trimesh.
+            Uses optional simplification / face sampling to keep the app responsive.
+            """
+            import plotly.graph_objects as go
+
+            m = mesh
+            try:
+                face_count = int(len(getattr(m, "faces", [])))
+                if face_count > max_faces:
+                    if hasattr(m, "simplify_quadratic_decimation"):
+                        m = m.simplify_quadratic_decimation(max_faces)
+                    else:
+                        import numpy as np
+                        idx = np.random.choice(face_count, size=max_faces, replace=False)
+                        m = m.submesh([idx], append=True)
+            except Exception:
+                pass
+
+            v = m.vertices
+            f = m.faces
+
+            fig = go.Figure(
+                data=[
+                    go.Mesh3d(
+                        x=v[:, 0],
+                        y=v[:, 1],
+                        z=v[:, 2],
+                        i=f[:, 0],
+                        j=f[:, 1],
+                        k=f[:, 2],
+                        opacity=1.0,
+                    )
+                ]
+            )
+            fig.update_layout(
+                margin=dict(l=0, r=0, t=0, b=0),
+                scene=dict(
+                    aspectmode="data",
+                    xaxis=dict(visible=False),
+                    yaxis=dict(visible=False),
+                    zaxis=dict(visible=False),
+                ),
+                showlegend=False,
+            )
+            return fig
+
+        def _load_step_metrics(step_bytes: bytes, units_label: str, scale: float):
             # Lazy imports so the rest of the app still loads if deps are missing
             import numpy as np
             import trimesh
@@ -243,18 +308,15 @@ def page_plate() -> None:
             else:
                 raise ValueError("Unsupported geometry returned from STEP loader.")
 
-            # Units conversion to inches
-            # If STEP is mm, convert mm -> in; if inches, keep.
-            unit_factor = 1.0
-            if str(units).lower() == "mm":
-                unit_factor = 1.0 / 25.4
+            # Convert imported geometry units -> inches, then apply user scale.
+            unit_factor = _units_to_inches_factor(units_label)
+            factor = float(unit_factor) * float(scale)
 
-            factor = unit_factor * float(scale)
+            # Scale a copy for preview + bbox math (in inches)
+            mesh_in = mesh.copy()
+            mesh_in.vertices = mesh.vertices * factor
 
-            verts = mesh.vertices * factor
-            vmin = verts.min(axis=0)
-            vmax = verts.max(axis=0)
-            ext = vmax - vmin
+            ext = mesh_in.extents
 
             # Volume (in^3)
             # If mesh isn't watertight, volume can be zero/invalid. We fall back to convex hull volume.
@@ -265,16 +327,19 @@ def page_plate() -> None:
                 except Exception:
                     vol = 0.0
 
-            return {
-                "bbox_w_in": float(ext[0]),
-                "bbox_l_in": float(ext[1]),
-                "bbox_h_in": float(ext[2]),
-                "volume_in3": float(vol),
-            }
+            return (
+                {
+                    "bbox_w_in": float(ext[0]),
+                    "bbox_l_in": float(ext[1]),
+                    "bbox_h_in": float(ext[2]),
+                    "volume_in3": float(vol),
+                },
+                mesh_in,
+            )
 
         if step_file is not None:
             try:
-                metrics = _load_step_metrics(step_file.getvalue(), step_units, float(step_scale))
+                metrics, step_mesh = _load_step_metrics(step_file.getvalue(), geom_units, float(step_scale))
                 w_in = metrics["bbox_w_in"]
                 l_in = metrics["bbox_l_in"]
                 h_in = metrics["bbox_h_in"]
@@ -291,6 +356,19 @@ def page_plate() -> None:
                         "Weight (lb)": round(wt_lbs, 2),
                     }
                 )
+                # Optional 3D preview (requires: plotly)
+                show_preview = st.checkbox(
+                    "Show 3D preview",
+                    value=True,
+                    help="Interactive preview in your browser (rotate/zoom).",
+                )
+                if show_preview:
+                    try:
+                        fig = _mesh_preview_plotly(step_mesh)
+                        st.plotly_chart(fig, use_container_width=True, height=300)
+                    except Exception as e:
+                        st.warning(f"Preview failed: {e}")
+
 
                 use_vals = st.button("Use these values in Plate entry", type="primary")
                 if use_vals:
@@ -313,7 +391,7 @@ def page_plate() -> None:
             except Exception as e:
                 st.error(
                     "STEP import failed. On Streamlit Cloud you must include the dependencies "
-                    "`trimesh` and `cascadio` in requirements.txt. Error: "
+                    "`trimesh` and `cascadio` in requirements.txt (and `plotly` for preview). Error: "
                     + str(e)
                 )
 
