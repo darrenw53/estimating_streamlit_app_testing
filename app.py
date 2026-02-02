@@ -3,6 +3,7 @@ import os
 import hmac
 import datetime
 from typing import Dict, Any, List, Tuple
+import math
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
@@ -11,79 +12,76 @@ import pandas as pd
 import logic
 from dxf_plate import parse_dxf_plate_single_part_geometry, render_part_thumbnail_data_uri
 
-
-# ============================================================
-# Streamlit App: Estimating Calculator (Plate / Structural / Welding)
-# - Uses the existing calculation logic in logic.py
-# - Stores an in-progress estimate in st.session_state
-# - Optional password protection via Streamlit secrets
-# ============================================================
-
-
 APP_TITLE = "Estimating Calculator"
-
 
 # ============================================================
 # Rolling model (Plate -> Optional)
-# - Estimated time driven primarily by part weight
-# - Adds modifiers for OD bucket, thickness, prebend, and tight tolerance
-# NOTE: These are starter defaults — you can tune once you see real shop feedback.
+# Estimated time driven primarily by part weight (calculated from plate parameters)
 # ============================================================
 
 ROLLING_OD_BUCKETS = ["<= 24 in", "24–60 in", "60–120 in", "> 120 in"]
 
-# Base "run time per item" by weight bucket (minutes/item)
-# Buckets: (max_weight_lbs, minutes)
-ROLLING_BASE_CYLINDER: List[Tuple[float, float]] = [
-    (250, 20),
-    (750, 35),
-    (1500, 55),
-    (3000, 85),
-    (6000, 130),
-    (float("inf"), 180),
+# Base rolling labor HOURS per part by weight bucket (lbs) — matches earlier guidance (hour-based)
+ROLLING_WEIGHT_BUCKETS_HR = [
+    (0.0, 100.0, 0.25),
+    (100.0, 250.0, 0.40),
+    (250.0, 500.0, 0.60),
+    (500.0, 1000.0, 0.90),
+    (1000.0, 2000.0, 1.40),
+    (2000.0, 4000.0, 2.20),
+    (4000.0, 8000.0, 3.20),
+    (8000.0, 12000.0, 4.25),
 ]
+ROLLING_OVER_12000_BASE_HR = 4.25
+ROLLING_OVER_12000_PER_4000_HR = 0.60
 
-ROLLING_BASE_CONE: List[Tuple[float, float]] = [
-    (250, 30),
-    (750, 55),
-    (1500, 85),
-    (3000, 125),
-    (6000, 185),
-    (float("inf"), 250),
-]
-
-# Setup time per lot (minutes) — applied once per line item when rolling is enabled
 ROLLING_SETUP_MIN = {
     "Cylinder": 30.0,
     "Cone": 45.0,
 }
 
-# OD multipliers
 ROLLING_OD_MULT = {
-    "<= 24 in": 1.00,
-    "24–60 in": 1.10,
-    "60–120 in": 1.20,
-    "> 120 in": 1.35,
+    "<= 24 in": 1.30,
+    "24–60 in": 1.00,
+    "60–120 in": 0.95,
+    "> 120 in": 0.90,
 }
 
-# Thickness multipliers (inches) — stacked as a single multiplier
 def _rolling_thickness_multiplier(thk_in: float) -> float:
-    if thk_in >= 2.0:
-        return 1.35
-    if thk_in >= 1.0:
-        return 1.15
-    return 1.00
+    t = float(thk_in or 0.0)
+    if t < 0.25:
+        return 0.85
+    if t < 0.50:
+        return 1.00
+    if t < 1.00:
+        return 1.25
+    return 1.60
+
+ROLLING_TYPE_MULT = {"Cylinder": 1.00, "Cone": 1.40}
+ROLLING_PREBEND_MULT = 1.20
+ROLLING_TOL_MULT = 1.10
 
 
-def _rolling_base_minutes_per_item(weight_lbs: float, roll_type: str) -> float:
-    table = ROLLING_BASE_CONE if roll_type == "Cone" else ROLLING_BASE_CYLINDER
-    for max_wt, mins in table:
-        if weight_lbs <= max_wt:
-            return float(mins)
-    return float(table[-1][1])
+def _rolling_base_hours_by_weight(weight_lbs: float) -> float:
+    w = max(0.0, float(weight_lbs or 0.0))
+    for lo, hi, hr in ROLLING_WEIGHT_BUCKETS_HR:
+        if w <= hi and w > lo:
+            return float(hr)
+        if w == 0.0 and lo == 0.0:
+            return float(hr)
+
+    if w > 12000.0:
+        extra = w - 12000.0
+        steps = math.ceil(extra / 4000.0)
+        return float(ROLLING_OVER_12000_BASE_HR + steps * ROLLING_OVER_12000_PER_4000_HR)
+
+    for _, hi, hr in ROLLING_WEIGHT_BUCKETS_HR:
+        if w <= hi:
+            return float(hr)
+    return float(ROLLING_OVER_12000_BASE_HR)
 
 
-def calculate_rolling_time(
+def calculate_rolling_time_minutes_per_item(
     weight_lbs: float,
     thickness_in: float,
     roll_type: str,
@@ -91,35 +89,35 @@ def calculate_rolling_time(
     prebend: bool,
     tight_tolerance: bool,
 ) -> Tuple[float, float, float, str]:
-    """
-    Returns:
-        rolling_time_item_min,
-        setup_min_lot,
-        total_multiplier,
-        details_string
-    """
-    weight_lbs = max(float(weight_lbs), 0.0)
-    thickness_in = max(float(thickness_in), 0.0)
     roll_type = "Cone" if str(roll_type).lower().startswith("cone") else "Cylinder"
+    base_hr = _rolling_base_hours_by_weight(weight_lbs)
 
-    base = _rolling_base_minutes_per_item(weight_lbs, roll_type)
-    od_mult = float(ROLLING_OD_MULT.get(od_bucket, 1.0))
-    thk_mult = float(_rolling_thickness_multiplier(thickness_in))
-    prebend_mult = 1.15 if prebend else 1.00
-    tol_mult = 1.25 if tight_tolerance else 1.00
+    mult = 1.0
+    mult *= _rolling_thickness_multiplier(thickness_in)
+    mult *= float(ROLLING_OD_MULT.get(od_bucket, 1.0))
+    mult *= float(ROLLING_TYPE_MULT.get(roll_type, 1.0))
+    if prebend:
+        mult *= float(ROLLING_PREBEND_MULT)
+    if tight_tolerance:
+        mult *= float(ROLLING_TOL_MULT)
 
-    total_mult = od_mult * thk_mult * prebend_mult * tol_mult
-    time_item = round(base * total_mult, 2)
-
-    setup = float(ROLLING_SETUP_MIN.get(roll_type, 30.0))
+    minutes_item = round(base_hr * mult * 60.0, 2)
+    setup_min = float(ROLLING_SETUP_MIN.get(roll_type, 30.0))
 
     details = (
-        f"base={base:.0f}min @ {weight_lbs:.0f}lb; "
-        f"OD={od_mult:.2f}x; THK={thk_mult:.2f}x; "
-        f"prebend={prebend_mult:.2f}x; tol={tol_mult:.2f}x"
+        f"base={base_hr:.2f}hr @ {float(weight_lbs):.0f}lb; "
+        f"ODx={ROLLING_OD_MULT.get(od_bucket, 1.0):.2f}; "
+        f"THKx={_rolling_thickness_multiplier(thickness_in):.2f}; "
+        f"typex={ROLLING_TYPE_MULT.get(roll_type, 1.0):.2f}; "
+        f"prebend={'Y' if prebend else 'N'}; tol={'Y' if tight_tolerance else 'N'}; "
+        f"mult={mult:.2f}"
     )
-    return time_item, setup, total_mult, details
+    return minutes_item, setup_min, mult, details
 
+
+# ============================================================
+# Session + Auth
+# ============================================================
 
 def _init_state() -> None:
     st.session_state.setdefault("authenticated", False)
@@ -127,27 +125,16 @@ def _init_state() -> None:
     st.session_state.setdefault("plate_yield_results", {})
     st.session_state.setdefault("structural_yield_results", {})
 
-
 def _get_password_from_secrets_or_env() -> str:
-    """Return app password from Streamlit secrets (preferred) or env var as fallback."""
-    # Preferred: Streamlit secrets
-    #   [auth]
-    #   password = "..."
     if "auth" in st.secrets and "password" in st.secrets["auth"]:
         return str(st.secrets["auth"]["password"])
-    # Fallback for local dev only
     return os.getenv("ESTIMATOR_APP_PASSWORD", "")
 
-
 def require_auth() -> None:
-    """Gate the app behind a password (if configured)."""
     password = _get_password_from_secrets_or_env()
-
-    # If no password is configured, run unlocked.
     if not password:
         st.session_state["authenticated"] = True
         return
-
     if st.session_state.get("authenticated"):
         return
 
@@ -164,19 +151,15 @@ def require_auth() -> None:
             st.error("Incorrect password")
     st.stop()
 
-
 @st.cache_data(show_spinner=False)
 def _load_aisc_once(csv_path: str) -> bool:
-    """Load AISC database once and cache it."""
     logic.aisc_data_load_attempted = False
     logic.AISC_TYPES_TO_LABELS_MAP = None
     logic.AISC_LABEL_TO_PROPERTIES_MAP = None
     logic.load_aisc_database(csv_path)
     return bool(logic.AISC_TYPES_TO_LABELS_MAP)
 
-
 def _create_yield_image(sheet_layout: Dict[str, Any], scale: int = 5) -> Image.Image:
-    """Create a PIL image for a plate nesting layout (displayed in Streamlit)."""
     padding = 20
     stock_w_px = int(sheet_layout["width"] * scale)
     stock_h_px = int(sheet_layout["height"] * scale)
@@ -206,22 +189,18 @@ def _create_yield_image(sheet_layout: Dict[str, Any], scale: int = 5) -> Image.I
             draw.text((x0 + 5, y0 + 5), f"{part['width']:.1f}x{part['height']:.1f}", fill="black", font=font)
     return img
 
-
 def _add_part(part: Dict[str, Any]) -> None:
     st.session_state["estimate_parts"].append(part)
-
 
 def _clear_estimate() -> None:
     st.session_state["estimate_parts"] = []
     st.session_state["plate_yield_results"] = {}
     st.session_state["structural_yield_results"] = {}
 
-
 def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     if not rows:
         return b""
 
-    # Build stable header order (match your Flask export ordering as much as possible)
     preferred_order = [
         "Estimation Type",
         "Part Name",
@@ -273,7 +252,6 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     header = [k for k in preferred_order if k in all_keys] + sorted([k for k in all_keys if k not in preferred_order])
 
     import csv
-
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=header, extrasaction="ignore")
     w.writeheader()
@@ -281,6 +259,10 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
         w.writerow(r)
     return buf.getvalue().encode("utf-8")
 
+
+# ============================================================
+# Pages
+# ============================================================
 
 def page_plate() -> None:
     st.header("Plate")
@@ -371,18 +353,13 @@ def page_plate() -> None:
 
             if detected_rows:
                 df = pd.DataFrame(detected_rows)
-
                 st.markdown("#### Detected parts")
                 edited = st.data_editor(
                     df,
                     use_container_width=True,
                     num_rows="fixed",
                     column_config={
-                        "Preview": st.column_config.ImageColumn(
-                            "Preview",
-                            help="Auto-rendered thumbnail of the detected profile.",
-                            width="small",
-                        ),
+                        "Preview": st.column_config.ImageColumn("Preview", width="small"),
                         "Thickness (in)": st.column_config.SelectboxColumn(
                             "Thickness (in)",
                             options=[float(x) for x in logic.THICKNESS_LIST],
@@ -393,12 +370,7 @@ def page_plate() -> None:
                             options=[str(x) for x in logic.MATERIALS_LIST],
                             required=True,
                         ),
-                        "Quantity": st.column_config.NumberColumn(
-                            "Quantity",
-                            min_value=1,
-                            step=1,
-                            required=True,
-                        ),
+                        "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
                     },
                 )
 
@@ -422,7 +394,6 @@ def page_plate() -> None:
                             drill_summary_str = ""
                             burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
 
-                            # No bends from DXF import (plate-only); user can edit later if desired.
                             bend_time_item = 0.0
 
                             net_weight_item = logic.calculate_plate_net_weight(
@@ -432,17 +403,6 @@ def page_plate() -> None:
                                 net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT
                             )
                             fit_time_item = logic.calculate_fit_time(net_weight_item)
-
-                            # Rolling defaults for DXF import (off)
-                            rolling_enabled = False
-                            roll_type = "Cylinder"
-                            roll_od_bucket = "24–60 in"
-                            roll_prebend = False
-                            roll_tight_tol = False
-                            roll_time_item = 0.0
-                            roll_setup_lot = 0.0
-                            roll_details = ""
-                            total_roll_time = 0.0
 
                             part = {
                                 "Estimation Type": "Plate",
@@ -464,27 +424,27 @@ def page_plate() -> None:
                                 "Net Weight (lbs/item)": round(net_weight_item, 2),
                                 "Gross Weight (lbs/item)": round(gross_weight_item, 2),
                                 "Fit Time (min/item)": float(fit_time_item),
-                                "Rolling Enabled": "Yes" if rolling_enabled else "No",
-                                "Rolling Type": roll_type,
-                                "Rolling OD Bucket": roll_od_bucket,
-                                "Rolling Prebend": "Yes" if roll_prebend else "No",
-                                "Rolling Tight Tolerance": "Yes" if roll_tight_tol else "No",
-                                "Rolling Time (min/item)": float(roll_time_item),
-                                "Rolling Setup (min/lot)": float(roll_setup_lot),
-                                "Rolling Details": roll_details,
-                                "Total Rolling Time (min)": float(total_roll_time),
+                                # Rolling defaults (off for DXF import)
+                                "Rolling Enabled": "No",
+                                "Rolling Type": "N/A",
+                                "Rolling OD Bucket": "N/A",
+                                "Rolling Prebend": "No",
+                                "Rolling Tight Tolerance": "No",
+                                "Rolling Time (min/item)": 0.0,
+                                "Rolling Setup (min/lot)": 0.0,
+                                "Rolling Details": "",
+                                "Total Rolling Time (min)": 0.0,
+                                # Totals
                                 "Total Gross Weight (lbs)": round(gross_weight_item * quantity, 2),
                                 "Total Burning Time (min)": round(burn_time_item * quantity, 2),
-                                "Total Drilling Time (min)": round(drilling_time_item * quantity, 2),
-                                "Total Bend Time (min)": round(bend_time_item * quantity, 2),
-                                "Total Rolling Time (min)": round(total_roll_time, 2),
+                                "Total Drilling Time (min)": 0.0,
+                                "Total Bend Time (min)": 0.0,
+                                "Total Rolling Time (min)": 0.0,
                                 "Total Fit Time (min)": round(fit_time_item * quantity, 2),
-                                # DXF metrics (kept for transparency)
+                                # DXF metrics
                                 "DXF Source": str(r.get("Source DXF", "")),
                                 "DXF Hole Count": int(r.get("Hole Count", 0)),
-                                "DXF Total Hole Circumference (in)": float(
-                                    r.get("Total Hole Circumference (in)", 0.0)
-                                ),
+                                "DXF Total Hole Circumference (in)": float(r.get("Total Hole Circumference (in)", 0.0)),
                             }
 
                             _add_part(part)
@@ -496,86 +456,118 @@ def page_plate() -> None:
                         st.success(f"Added {added_n} plate part(s) from DXF.")
                         st.rerun()
             else:
-                st.warning("No closed profiles were detected in the uploaded DXFs (or everything was filtered out by ignored layers).")
+                st.warning("No closed profiles were detected in the uploaded DXFs.")
 
-    with st.form("plate_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            part_name = st.text_input("Part name", value="Unnamed Plate")
-            quantity = st.number_input("Quantity", min_value=1, value=1, step=1)
-            material = st.selectbox("Material", options=logic.MATERIALS_LIST, index=0)
-            thickness = st.selectbox("Thickness (in)", options=logic.THICKNESS_LIST, index=0)
-        with c2:
-            width = st.number_input("Width (in)", min_value=0.0, value=0.0, step=0.25)
-            length = st.number_input("Length (in)", min_value=0.0, value=0.0, step=0.25)
-            num_bends = st.number_input("Bends (per item)", min_value=0, value=0, step=1)
-            bend_complexity = st.selectbox("Bend complexity", options=["N/A"] + logic.BEND_COMPLEXITY_OPTIONS, index=0)
-            if int(num_bends) == 0:
-                bend_complexity = "N/A"
+    # ------------------------------------------------------------
+    # Manual Plate Entry (NOT a form)
+    # This allows Rolling options to expand immediately when checked.
+    # ------------------------------------------------------------
+    st.subheader("Manual plate entry")
 
-        st.markdown("#### Drilling (optional)")
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            hole_dia_1 = st.number_input("Hole 1 dia (in)", min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_1 = st.number_input("Hole 1 qty", min_value=0, value=0, step=1)
-        with d2:
-            hole_dia_2 = st.number_input("Hole 2 dia (in)", min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_2 = st.number_input("Hole 2 qty", min_value=0, value=0, step=1)
-        with d3:
-            hole_dia_3 = st.number_input("Hole 3 dia (in)", min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_3 = st.number_input("Hole 3 qty", min_value=0, value=0, step=1)
-
-        st.markdown("#### Rolling (optional)")
-        rolling_enabled = st.checkbox(
-            "Rolling required",
-            value=False,
-            help="Adds rolling time based on calculated plate weight + modifiers.",
+    c1, c2 = st.columns(2)
+    with c1:
+        part_name = st.text_input("Part name", value="Unnamed Plate", key="plate_part_name")
+        quantity = st.number_input("Quantity", min_value=1, value=1, step=1, key="plate_qty")
+        material = st.selectbox("Material", options=logic.MATERIALS_LIST, index=0, key="plate_mat")
+        thickness = st.selectbox("Thickness (in)", options=logic.THICKNESS_LIST, index=0, key="plate_thk")
+    with c2:
+        width = st.number_input("Width (in)", min_value=0.0, value=0.0, step=0.25, key="plate_w")
+        length = st.number_input("Length (in)", min_value=0.0, value=0.0, step=0.25, key="plate_l")
+        num_bends = st.number_input("Bends (per item)", min_value=0, value=0, step=1, key="plate_bends")
+        bend_complexity = st.selectbox(
+            "Bend complexity",
+            options=["N/A"] + logic.BEND_COMPLEXITY_OPTIONS,
+            index=0,
+            key="plate_bend_cx",
         )
-        roll_type = "Cylinder"
-        roll_od_bucket = "24–60 in"
-        roll_prebend = False
-        roll_tight_tol = False
+        if int(num_bends) == 0:
+            bend_complexity = "N/A"
 
-        if rolling_enabled:
-            r1, r2, r3, r4 = st.columns([1.2, 1.2, 1.0, 1.0])
-            with r1:
-                roll_type = st.selectbox("Rolling type", options=["Cylinder", "Cone"], index=0)
-            with r2:
-                roll_od_bucket = st.selectbox("OD bucket", options=ROLLING_OD_BUCKETS, index=1)
-            with r3:
-                roll_prebend = st.checkbox("Prebend", value=False)
-            with r4:
-                roll_tight_tol = st.checkbox("Tight tolerance", value=False)
+    st.markdown("#### Drilling (optional)")
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        hole_dia_1 = st.number_input("Hole 1 dia (in)", min_value=0.0, value=0.0, step=0.0625, key="h1d")
+        hole_qty_1 = st.number_input("Hole 1 qty", min_value=0, value=0, step=1, key="h1q")
+    with d2:
+        hole_dia_2 = st.number_input("Hole 2 dia (in)", min_value=0.0, value=0.0, step=0.0625, key="h2d")
+        hole_qty_2 = st.number_input("Hole 2 qty", min_value=0, value=0, step=1, key="h2q")
+    with d3:
+        hole_dia_3 = st.number_input("Hole 3 dia (in)", min_value=0.0, value=0.0, step=0.0625, key="h3d")
+        hole_qty_3 = st.number_input("Hole 3 qty", min_value=0, value=0, step=1, key="h3q")
 
-        add = st.form_submit_button("Add plate to estimate")
+    st.markdown("#### Rolling (optional)")
+    rolling_enabled = st.checkbox(
+        "Rolling required",
+        value=False,
+        help="When enabled, rolling time is calculated from the plate weight + modifiers.",
+        key="rolling_enabled",
+    )
+
+    # These MUST be outside a form so they appear instantly
+    roll_type = "Cylinder"
+    roll_od_bucket = "24–60 in"
+    roll_prebend = False
+    roll_tight_tol = False
+
+    if rolling_enabled:
+        r1, r2, r3, r4 = st.columns([1.2, 1.4, 1.0, 1.2])
+        with r1:
+            roll_type = st.selectbox("Rolling type", options=["Cylinder", "Cone"], index=0, key="roll_type")
+        with r2:
+            roll_od_bucket = st.selectbox("OD bucket", options=ROLLING_OD_BUCKETS, index=1, key="roll_od")
+        with r3:
+            roll_prebend = st.checkbox("Prebend", value=False, key="roll_prebend")
+        with r4:
+            roll_tight_tol = st.checkbox("Tight tolerance", value=False, key="roll_tol")
+
+    # Optional preview of what rolling would be (helps estimator trust)
+    try:
+        net_wt_preview = logic.calculate_plate_net_weight(
+            float(thickness), float(width), float(length), logic.DENSITY_FACTOR_FOR_CALCULATION
+        )
+    except Exception:
+        net_wt_preview = 0.0
+
+    if rolling_enabled and net_wt_preview > 0:
+        roll_time_item_prev, setup_prev, mult_prev, details_prev = calculate_rolling_time_minutes_per_item(
+            weight_lbs=net_wt_preview,
+            thickness_in=float(thickness),
+            roll_type=roll_type,
+            od_bucket=roll_od_bucket,
+            prebend=bool(roll_prebend),
+            tight_tolerance=bool(roll_tight_tol),
+        )
+        st.caption(
+            f"Rolling preview (using net wt {net_wt_preview:.1f} lb): "
+            f"{roll_time_item_prev:.1f} min/item + {setup_prev:.0f} min setup. ({details_prev})"
+        )
+
+    add = st.button("Add plate to estimate", type="primary", key="plate_add_btn")
 
     if add:
-        # Build a form-like dict for existing logic
         fake_form = {
-            "hole_dia_1": hole_dia_1,
-            "hole_qty_1": hole_qty_1,
-            "hole_dia_2": hole_dia_2,
-            "hole_qty_2": hole_qty_2,
-            "hole_dia_3": hole_dia_3,
-            "hole_qty_3": hole_qty_3,
+            "hole_dia_1": hole_dia_1, "hole_qty_1": hole_qty_1,
+            "hole_dia_2": hole_dia_2, "hole_qty_2": hole_qty_2,
+            "hole_dia_3": hole_dia_3, "hole_qty_3": hole_qty_3,
         }
 
         burn_machine = logic.get_plate_burn_machine_type(thickness)
         perimeter = logic.calculate_plate_perimeter(width, length)
         feedrate = logic.get_feedrate_for_thickness(thickness, logic.FEEDRATE_TABLE_IPM)
+
         drilling_time_item, drill_summary_str = logic.process_plate_drilling_data(fake_form, thickness)
         burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
         bend_time_item = round(
             logic.calculate_bend_time(int(num_bends), bend_complexity, logic.BEND_TIME_PER_COMPLEXITY_MINUTES), 2
         )
+
         net_weight_item = logic.calculate_plate_net_weight(thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION)
         gross_weight_item = logic.calculate_gross_weight(net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
         fit_time_item = logic.calculate_fit_time(net_weight_item)
 
-        # Rolling calc (optional)
         if rolling_enabled:
-            roll_time_item, roll_setup_lot, roll_mult, roll_details = calculate_rolling_time(
-                weight_lbs=net_weight_item,  # use net weight as driver
+            roll_time_item, roll_setup_lot, roll_mult, roll_details = calculate_rolling_time_minutes_per_item(
+                weight_lbs=net_weight_item,
                 thickness_in=float(thickness),
                 roll_type=roll_type,
                 od_bucket=roll_od_bucket,
@@ -627,8 +619,10 @@ def page_plate() -> None:
             "Total Rolling Time (min)": round(total_roll_time, 2),
             "Total Fit Time (min)": round(fit_time_item * quantity, 2),
         }
+
         _add_part(part)
         st.success("Plate added.")
+        st.rerun()
 
 
 def page_structural() -> None:
@@ -639,38 +633,22 @@ def page_structural() -> None:
 
     structural_types = sorted(list(logic.AISC_TYPES_TO_LABELS_MAP.keys()))
 
-    # NOTE: We intentionally do NOT wrap these widgets in a st.form.
-    # Streamlit forms do not rerun the script on widget changes, which breaks
-    # dependent dropdowns (Type -> Shape). Keeping them outside the form ensures
-    # the Shape list updates immediately when Type changes.
-
-    # Streamlit can sometimes keep the previous selectbox value even when
-    # the options list changes (especially with very large lists).
-    # To make the dependent dropdown rock-solid, we give the Shape widget a
-    # *type-specific key* so it remounts whenever Type changes.
-
     def _cleanup_old_shape_keys(current_type: str) -> None:
         prefix = "struct_shape_"
         for k in list(st.session_state.keys()):
             if k.startswith(prefix) and k != f"{prefix}{current_type}":
-                # keep state tidy; not strictly required
                 del st.session_state[k]
 
     c1, c2 = st.columns(2)
     with c1:
         part_name = st.text_input("Part name", value="Unnamed Structural")
         quantity = st.number_input("Quantity", min_value=1, value=1, step=1)
-        structural_type = st.selectbox(
-            "Type",
-            options=structural_types,
-            key="struct_type",
-        )
+        structural_type = st.selectbox("Type", options=structural_types, key="struct_type")
     with c2:
         labels = logic.AISC_TYPES_TO_LABELS_MAP.get(structural_type, [])
         _cleanup_old_shape_keys(structural_type)
 
         shape_key = f"struct_shape_{structural_type}"
-        # Ensure there is a valid default for this Type.
         if labels and shape_key not in st.session_state:
             st.session_state[shape_key] = labels[0]
         shape_label = st.selectbox("Shape", options=labels, key=shape_key)
@@ -710,7 +688,6 @@ def page_structural() -> None:
             "Total Gross Weight (lbs)": round(gross_wt * quantity, 2),
             "Total Cutting Time (min)": round(cut_t * quantity, 2),
             "Total Fit Time (min)": round(fit_t * quantity, 2),
-            # Keep these so totals logic is simpler
             "Burn Machine Type": "N/A",
             "Burning Time (min/item)": 0.0,
             "Total Burning Time (min)": 0.0,
@@ -719,7 +696,6 @@ def page_structural() -> None:
             "Drilling Time (min/item)": 0.0,
             "Total Drilling Time (min)": 0.0,
             "Drill Details Summary": "N/A",
-            # Rolling fields (not applicable)
             "Rolling Enabled": "No",
             "Rolling Type": "N/A",
             "Rolling OD Bucket": "N/A",
@@ -736,7 +712,7 @@ def page_structural() -> None:
 
 def page_welding() -> None:
     st.header("Welding")
-    st.caption("Enter welds (up to 50). Add as a single summary line to the estimate.")
+    st.caption("Enter welds (up to 10 shown). Add as a single summary line to the estimate.")
 
     with st.form("weld_form"):
         weld_entries = []
@@ -745,7 +721,6 @@ def page_welding() -> None:
         cjp_count = 0
 
         for i in range(1, 11):
-            # (Most users only need a handful; increase to 50 if you want, but 10 is cleaner UI.)
             cols = st.columns([2, 2, 1, 1])
             with cols[0]:
                 size = st.selectbox(f"Weld size #{i}", options=[""] + logic.WELD_SIZE_OPTIONS, key=f"wsize_{i}")
@@ -779,7 +754,6 @@ def page_welding() -> None:
             "Weld Details Summary": weld_details_summary,
             "Total Weld Wire (lbs)": total_wire_weight,
             "Total Weld Time (hours)": total_time_hours,
-            # Keep totals keys consistent
             "Total Gross Weight (lbs)": 0.0,
             "Total Burning Time (min)": 0.0,
             "Total Drilling Time (min)": 0.0,
@@ -797,7 +771,6 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     struct_wt = 0.0
     plt_bend_t = 0.0
     plt_roll_t = 0.0
-    # Structural cutting time is treated as "saw" time in the UI totals.
     str_cut_t = 0.0
     fit_t = 0.0
     laser_burn_t = 0.0
@@ -813,7 +786,6 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     for r in rows:
         fit_t += float(r.get("Total Fit Time (min)", 0.0) or 0.0)
 
-        # Perimeter is stored as inches per item; multiply by quantity where available.
         try:
             per_item = float(r.get("Perimeter (in/item)", 0.0) or 0.0)
             qty = int(r.get("Quantity", 0) or 0)
@@ -846,9 +818,7 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "grand_total_plate_drilling_time": drill_t,
         "grand_total_plate_bend_time": plt_bend_t,
         "grand_total_plate_rolling_time": plt_roll_t,
-        # Back-compat key (older UI label)
         "grand_total_structural_cutting_time": str_cut_t,
-        # Preferred key (explicit)
         "grand_total_saw_time": str_cut_t,
         "grand_total_fit_time": fit_t,
         "grand_total_weld_time_hours": weld_time_hr,
@@ -869,33 +839,17 @@ def page_summary() -> None:
 
     totals = _compute_totals(rows)
 
-    # Primary headline totals
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total gross weight (lbs)", f"{totals['combined_overall_gross_weight']:.2f}")
     c2.metric("Total fit time (min)", f"{totals['grand_total_fit_time']:.2f}")
     c3.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
     c4.metric("Total perimeter (in)", f"{totals['grand_total_perimeter_in']:.2f}")
 
-    # Time breakdown (requested): Saw / Laser / Kinetic (+ Rolling)
     t1, t2, t3, t4 = st.columns(4)
     t1.metric("Saw time (min)", f"{totals.get('grand_total_saw_time', totals.get('grand_total_structural_cutting_time', 0.0)):.2f}")
     t2.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
     t3.metric("Kinetic time (min)", f"{totals['grand_total_kinetic_burn_time']:.2f}")
     t4.metric("Rolling time (min)", f"{totals['grand_total_plate_rolling_time']:.2f}")
-
-    with st.expander("More totals", expanded=False):
-        st.write(
-            {
-                "Laser burn (min)": round(totals["grand_total_laser_burn_time"], 2),
-                "Kinetic burn (min)": round(totals["grand_total_kinetic_burn_time"], 2),
-                "Plate drilling (min)": round(totals["grand_total_plate_drilling_time"], 2),
-                "Plate bend (min)": round(totals["grand_total_plate_bend_time"], 2),
-                "Plate rolling (min)": round(totals["grand_total_plate_rolling_time"], 2),
-                "Saw time (min)": round(totals.get("grand_total_saw_time", totals.get("grand_total_structural_cutting_time", 0.0)), 2),
-                "Weld wire (lbs)": round(totals["grand_total_weld_wire_lbs"], 2),
-                "Total perimeter (in)": round(totals["grand_total_perimeter_in"], 2),
-            }
-        )
 
     st.dataframe(rows, use_container_width=True)
 
@@ -907,176 +861,12 @@ def page_summary() -> None:
         mime="text/csv",
     )
 
-    st.divider()
-
-    # ---- Plate yield ----
-    if totals["has_plate_entries"]:
-        st.subheader("Plate yield")
-        # Group plates by thickness + material
-        grouped = {}
-        for r in rows:
-            if r.get("Estimation Type") != "Plate":
-                continue
-            key = f"{float(r.get('Thickness (in)', 0.0)):.4f}in_{r.get('Material', 'N/A')}"
-            grouped.setdefault(key, {"material": r.get("Material"), "thickness": r.get("Thickness (in)"), "parts_list": []})
-            grouped[key]["parts_list"].append(
-                {
-                    "width": float(r.get("Width (in)", 0.0) or 0.0),
-                    "height": float(r.get("Length (in)", 0.0) or 0.0),
-                    "quantity": int(r.get("Quantity", 0) or 0),
-                }
-            )
-
-        with st.form("plate_yield"):
-            stock_inputs = {}
-            for key, g in grouped.items():
-                st.markdown(f"**{g['material']} @ {float(g['thickness']):.4f} in**")
-                c1, c2 = st.columns(2)
-                with c1:
-                    sw = st.number_input(f"Stock width (in) — {key}", min_value=0.0, value=60.0, step=1.0)
-                with c2:
-                    sl = st.number_input(f"Stock length (in) — {key}", min_value=0.0, value=120.0, step=1.0)
-                stock_inputs[key] = (float(sw), float(sl))
-                st.write("—")
-            run = st.form_submit_button("Calculate plate yield")
-
-        if run:
-            results = {}
-            for key, g in grouped.items():
-                stock_w, stock_h = stock_inputs[key]
-                sheets_needed, layouts = logic.calculate_plate_nesting_yield(g["parts_list"], stock_w, stock_h)
-                total_parts_area = sum(p["width"] * p["height"] * p["quantity"] for p in g["parts_list"])
-                total_stock_area = sheets_needed * stock_w * stock_h
-                yield_pct = (total_parts_area / total_stock_area) * 100 if total_stock_area > 0 else 0.0
-                results[key] = {
-                    "stock_size": f"{stock_w:.2f}x{stock_h:.2f} in",
-                    "sheets_needed": sheets_needed,
-                    "yield_percent": yield_pct,
-                    "layouts": layouts,
-                    "unplaced_count": len(layouts[-1].get("unplaced_parts", [])) if layouts else 0,
-                }
-            st.session_state["plate_yield_results"] = results
-
-        # Display saved results
-        if st.session_state["plate_yield_results"]:
-            for key, res in st.session_state["plate_yield_results"].items():
-                st.markdown(f"**{key}**")
-                st.write(
-                    {
-                        "Stock": res["stock_size"],
-                        "Sheets needed": res["sheets_needed"],
-                        "Yield %": round(res["yield_percent"], 2),
-                        "Unplaced": res["unplaced_count"],
-                    }
-                )
-                for i, layout in enumerate(res.get("layouts", []), start=1):
-                    st.image(_create_yield_image(layout), caption=f"Sheet {i}")
-
-    # ---- Structural yield ----
-    if totals["has_structural_entries"]:
-        st.subheader("Structural yield")
-        # Group by shape label
-        grouped_struct = {}
-        for r in rows:
-            if r.get("Estimation Type") != "Structural":
-                continue
-            label = r.get("Shape Label")
-            if not label:
-                continue
-            grouped_struct.setdefault(label, []).append(
-                {"length": float(r.get("Length (in)", 0.0)), "quantity": int(r.get("Quantity", 0))}
-            )
-
-        with st.form("struct_yield"):
-            stock_len_inputs = {}
-            for label in grouped_struct:
-                stock_len_inputs[label] = st.text_input(
-                    f"Stock lengths for {label} (comma-separated, inches)",
-                    value="240, 480",
-                )
-            run_s = st.form_submit_button("Calculate structural yield")
-
-        if run_s:
-            yield_results_by_shape = {}
-            for label, parts_list in grouped_struct.items():
-                stock_str = stock_len_inputs.get(label, "")
-                try:
-                    stock_lengths = sorted(
-                        [float(s.strip()) for s in stock_str.split(",") if s.strip() and float(s.strip()) > 0],
-                        reverse=True,
-                    )
-                except Exception:
-                    yield_results_by_shape[label] = {"error": "Invalid stock lengths."}
-                    continue
-
-                all_cuts = []
-                total_req = 0.0
-                for pe in parts_list:
-                    all_cuts.extend([float(pe["length"])] * int(pe["quantity"]))
-                    total_req += float(pe["length"]) * int(pe["quantity"])
-                if not all_cuts:
-                    yield_results_by_shape[label] = {"info": "No cuts required."}
-                    continue
-
-                options = []
-                best = {"stock_length": None, "bars_used": float("inf"), "total_waste": float("inf"), "yield_percentage": 0.0}
-                for stock_len in stock_lengths:
-                    cuts_fit = [c for c in all_cuts if c <= stock_len]
-                    if not cuts_fit:
-                        options.append({"stock_length": stock_len, "bars_used": 0, "total_waste": 0.0, "yield_percentage": 0.0, "info": "No cuts fit."})
-                        continue
-                    bars, waste = logic.calculate_yield_for_stock_size(list(cuts_fit), stock_len)
-                    actual_cut = sum(cuts_fit)
-                    total_stock = bars * stock_len
-                    yield_pct = (actual_cut / total_stock) * 100 if total_stock > 0 else 0.0
-                    can_make_all = len(cuts_fit) == len(all_cuts)
-                    current = {
-                        "stock_length": stock_len,
-                        "bars_used": bars,
-                        "total_waste": round(waste, 2),
-                        "yield_percentage": round(yield_pct, 2),
-                        "can_make_all_parts": can_make_all,
-                    }
-                    options.append(current)
-                    if can_make_all:
-                        if (current["bars_used"] < best["bars_used"]) or (
-                            current["bars_used"] == best["bars_used"] and current["total_waste"] < best["total_waste"]
-                        ):
-                            best = current.copy()
-                for o in options:
-                    o["is_best"] = best["stock_length"] is not None and o.get("stock_length") == best.get("stock_length")
-                yield_results_by_shape[label] = {
-                    "options": options,
-                    "best_overall": best if best["stock_length"] is not None else None,
-                    "total_required_length": round(total_req, 2),
-                }
-            st.session_state["structural_yield_results"] = yield_results_by_shape
-
-        if st.session_state["structural_yield_results"]:
-            for label, res in st.session_state["structural_yield_results"].items():
-                st.markdown(f"**{label}**")
-                if "error" in res:
-                    st.error(res["error"])
-                    continue
-                if "info" in res:
-                    st.info(res["info"])
-                    continue
-                st.write({"Total required length (in)": res.get("total_required_length")})
-                for o in res.get("options", []):
-                    tag = "✅ best" if o.get("is_best") else ""
-                    st.write(
-                        f"{tag} Stock {o['stock_length']:.2f} in → bars: {o['bars_used']}, "
-                        f"waste: {o.get('total_waste',0):.2f} in, yield: {o.get('yield_percentage',0):.2f}% "
-                        f"({'ALL parts' if o.get('can_make_all_parts') else 'partial'})"
-                    )
-
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     _init_state()
     require_auth()
 
-    # Load AISC DB
     ok = _load_aisc_once(logic.AISC_CSV_FILENAME)
     if not ok:
         st.warning("AISC database could not be loaded. Structural tab will not work until the CSV is present.")
