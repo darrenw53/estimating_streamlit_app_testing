@@ -20,7 +20,6 @@ from dxf_plate import parse_dxf_plate_single_part_geometry, render_part_thumbnai
 # - Optional password protection via Streamlit secrets
 # ============================================================
 
-
 APP_TITLE = "Estimating Calculator"
 
 
@@ -30,7 +29,7 @@ def _init_state() -> None:
     st.session_state.setdefault("plate_yield_results", {})
     st.session_state.setdefault("structural_yield_results", {})
 
-    # STEP/DXF-assisted plate defaults (used as initial values for keyed widgets)
+    # Plate STEP-derived defaults (used to populate plate form)
     st.session_state.setdefault("plate_part_name", "Unnamed Plate")
     st.session_state.setdefault("plate_qty", 1)
     st.session_state.setdefault("plate_w", 0.0)
@@ -40,19 +39,15 @@ def _init_state() -> None:
     st.session_state.setdefault("plate_step_bbox_h_in", 0.0)
     st.session_state.setdefault("plate_step_loaded_name", "")
 
-    # ✅ Persist STEP parts table edits so checkboxes don't snap back on rerun
+    # Persist STEP parts table edits so checkbox changes stick across reruns
     st.session_state.setdefault("step_parts_df", None)
     st.session_state.setdefault("step_parts_signature", None)
 
 
 def _get_password_from_secrets_or_env() -> str:
     """Return app password from Streamlit secrets (preferred) or env var as fallback."""
-    # Preferred: Streamlit secrets
-    #   [auth]
-    #   password = "..."
     if "auth" in st.secrets and "password" in st.secrets["auth"]:
         return str(st.secrets["auth"]["password"])
-    # Fallback for local dev only
     return os.getenv("ESTIMATOR_APP_PASSWORD", "")
 
 
@@ -152,6 +147,13 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
         "Burn Machine Type",
         "Drill Details Summary",
         "Weld Details Summary",
+        "Rolling Required",
+        "Rolling Type",
+        "Rolling OD Bucket",
+        "Rolling Prebend",
+        "Rolling Tight Tolerance",
+        "Rolling Time (min/item)",
+        "Total Rolling Run Time (min)",
         "Bends (per item)",
         "Bend Complexity",
         "Perimeter (in/item)",
@@ -175,6 +177,11 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
         "Total Fit Time (min)",
         "Total Weld Wire (lbs)",
         "Total Weld Time (hours)",
+        "STEP Volume (in^3)",
+        "STEP Weight (lbs/item)",
+        "STEP BBox H (in)",
+        "STEP Source File",
+        "DXF Source",
     ]
 
     all_keys = set().union(*[r.keys() for r in rows])
@@ -193,21 +200,25 @@ def _structural_end_perimeter_one_end_in(props: Dict[str, Any]) -> float:
     """Approximate end perimeter (inches) for ONE end of a structural shape from AISC props."""
     shape = str(props.get("Shape", "") or props.get("Type", "") or "").upper()
 
+    # HSS rectangular: 2*(B+H)
     if "HSS" in shape:
         b = float(props.get("B_float", 0.0) or 0.0)
         h = float(props.get("Ht_float", 0.0) or 0.0)
         if b > 0 and h > 0:
             return 2.0 * (b + h)
 
+        # HSS round fallback
         od = float(props.get("OD_float", 0.0) or 0.0)
         if od > 0:
             return math.pi * od
 
+    # Pipe / Tube: pi*OD
     if "PIPE" in shape or "TUBE" in shape:
         od = float(props.get("OD_float", 0.0) or 0.0)
         if od > 0:
             return math.pi * od
 
+    # Wide-flange or general fallback: 2*(bf+d) if available
     bf = float(props.get("bf_float", 0.0) or 0.0)
     d = float(props.get("d_float", 0.0) or 0.0)
     if bf > 0 and d > 0:
@@ -220,12 +231,60 @@ def page_plate() -> None:
     st.header("Plate")
 
     # ------------------------------------------------------------
+    # Rolling heuristic (minutes per item) based on weight + options
+    # ------------------------------------------------------------
+    def _rolling_time_minutes_per_item(
+        weight_lbs: float,
+        rolling_type: str,
+        od_bucket: str,
+        prebend: bool,
+        tight_tolerance: bool,
+    ) -> float:
+        """
+        Heuristic rolling runtime (minutes/item) based on part weight + options.
+        Adjust these buckets to match your shop’s actuals.
+        """
+        w = max(0.0, float(weight_lbs or 0.0))
+
+        # Base time by weight bucket (minutes)
+        if w <= 250:
+            base = 15
+        elif w <= 500:
+            base = 30
+        elif w <= 1000:
+            base = 45
+        elif w <= 2000:
+            base = 75
+        elif w <= 4000:
+            base = 120
+        else:
+            base = 180
+
+        rtype = (rolling_type or "Cylinder").strip().lower()
+        if rtype.startswith("cone"):
+            base *= 1.25
+
+        bucket = (od_bucket or "").lower()
+        if "small" in bucket or "<" in bucket:
+            base *= 1.20
+        elif "medium" in bucket:
+            base *= 1.10
+        # large bucket: no multiplier
+
+        if prebend:
+            base += 15  # +0.25 hr
+        if tight_tolerance:
+            base += 30  # +0.50 hr
+
+        return float(round(base, 2))
+
+    # ------------------------------------------------------------
     # 3D STEP Import (BBOX / Volume / Weight)
     # ------------------------------------------------------------
     with st.expander("3D STEP Import (BBOX / Volume / Weight)", expanded=False):
         st.caption(
-            "Upload a .STEP/.STP file to extract overall bounding box and volume. "
-            "We convert to a mesh under the hood and compute weight from volume using a density."
+            "Upload .STEP/.STP files to extract overall bounding box and volume/weight. "
+            "Smallest bbox dimension is treated as thickness; the other two become width/length."
         )
 
         u1, u2, u3 = st.columns([1.2, 1, 2])
@@ -234,10 +293,8 @@ def page_plate() -> None:
                 "Imported geometry units",
                 options=["meters (recommended)", "millimeters", "inches"],
                 index=0,
-                help=(
-                    "Most STEP loads via trimesh+cascadio come in meters. "
-                    "If your bbox/volume looks way off, try switching this."
-                ),
+                help="Most STEP loads via trimesh+cascadio come in meters. If bbox/volume looks off, switch this.",
+                key="step_units",
             )
         with u2:
             step_scale = st.number_input(
@@ -245,7 +302,8 @@ def page_plate() -> None:
                 min_value=0.0001,
                 value=1.0,
                 step=0.1,
-                help="Applied after unit conversion. Example: if model is at 1/10 scale, enter 10.0.",
+                help="Applied after unit conversion. Example: if model is 1/10 scale, enter 10.0.",
+                key="step_scale",
             )
         with u3:
             density = st.number_input(
@@ -254,6 +312,7 @@ def page_plate() -> None:
                 value=float(getattr(logic, "DENSITY_FACTOR_FOR_CALCULATION", 0.283)),
                 step=0.001,
                 help="Steel is ~0.283 lb/in³. Stainless is ~0.289 lb/in³.",
+                key="step_density",
             )
 
         step_files = st.file_uploader(
@@ -267,7 +326,7 @@ def page_plate() -> None:
             label = (units_label or "").lower()
             if "meter" in label:
                 return 39.37007874015748
-            if "millimeter" in label or label == "mm":
+            if "millimeter" in label:
                 return 1.0 / 25.4
             return 1.0
 
@@ -280,10 +339,6 @@ def page_plate() -> None:
                 if face_count > max_faces:
                     if hasattr(m, "simplify_quadratic_decimation"):
                         m = m.simplify_quadratic_decimation(max_faces)
-                    else:
-                        import numpy as np
-                        idx = np.random.choice(face_count, size=max_faces, replace=False)
-                        m = m.submesh([idx], append=True)
             except Exception:
                 pass
 
@@ -331,7 +386,6 @@ def page_plate() -> None:
                     float(ext_raw[2] * factor),
                 ]
                 dims_sorted = sorted(dims_in)
-
                 t_in = float(dims_sorted[0])
                 w_in = float(dims_sorted[1])
                 l_in = float(dims_sorted[2])
@@ -366,7 +420,7 @@ def page_plate() -> None:
                     if not isinstance(geom, trimesh.Trimesh):
                         continue
                     row_id = str(uuid.uuid4())[:8]
-                    bw, bl, bh, vol, wt = _metrics(geom)
+                    bw, bl, bt, vol, wt = _metrics(geom)
                     rows.append(
                         {
                             "Include": True,
@@ -375,11 +429,11 @@ def page_plate() -> None:
                             "Row ID": row_id,
                             "Qty": 1,
                             "Material": str(logic.MATERIALS_LIST[0]),
-                            "Thickness (in)": _snap_thickness_to_list(bh),
+                            "Thickness (in)": _snap_thickness_to_list(bt),
                             "Use STEP weight": True,
                             "BBox W (in)": round(bw, 3),
                             "BBox L (in)": round(bl, 3),
-                            "Inferred Thickness (in)": round(bh, 4),
+                            "Inferred Thickness (in)": round(bt, 4),
                             "Volume (in³)": round(vol, 3),
                             "Weight (lb)": round(wt, 2),
                         }
@@ -387,7 +441,7 @@ def page_plate() -> None:
                     meshes_by_id[row_id] = geom
             elif hasattr(scene_or_mesh, "vertices") and hasattr(scene_or_mesh, "faces"):
                 row_id = str(uuid.uuid4())[:8]
-                bw, bl, bh, vol, wt = _metrics(scene_or_mesh)
+                bw, bl, bt, vol, wt = _metrics(scene_or_mesh)
                 rows.append(
                     {
                         "Include": True,
@@ -396,11 +450,11 @@ def page_plate() -> None:
                         "Row ID": row_id,
                         "Qty": 1,
                         "Material": str(logic.MATERIALS_LIST[0]),
-                        "Thickness (in)": _snap_thickness_to_list(bh),
+                        "Thickness (in)": _snap_thickness_to_list(bt),
                         "Use STEP weight": True,
                         "BBox W (in)": round(bw, 3),
                         "BBox L (in)": round(bl, 3),
-                        "Inferred Thickness (in)": round(bh, 4),
+                        "Inferred Thickness (in)": round(bt, 4),
                         "Volume (in³)": round(vol, 3),
                         "Weight (lb)": round(wt, 2),
                     }
@@ -428,7 +482,7 @@ def page_plate() -> None:
                     mesh_cache.update(meshes_by_id)
                 except Exception as e:
                     st.error(
-                        "STEP import failed. On Streamlit Cloud you must include the dependencies "
+                        "STEP import failed. On Streamlit Cloud include dependencies "
                         "`trimesh` and `cascadio` in requirements.txt (and `plotly` for preview). Error: "
                         + str(e)
                     )
@@ -436,7 +490,7 @@ def page_plate() -> None:
             if not all_rows:
                 st.warning("No parts found in the uploaded STEP file(s).")
             else:
-                # ✅ Build a signature so we only rebuild the table when inputs change
+                # Signature ensures the editor stays stable across reruns
                 sig = (
                     tuple((f.name, len(f.getvalue())) for f in step_files),
                     str(geom_units),
@@ -444,26 +498,22 @@ def page_plate() -> None:
                     float(density),
                 )
 
-                # ✅ Only rebuild if the upload/signature changed (or first load)
                 if (st.session_state.get("step_parts_signature") != sig) or (st.session_state.get("step_parts_df") is None):
                     df_parts = pd.DataFrame(all_rows)
-
-                    # Force dtypes so Streamlit renders editable checkbox columns
                     for col in ["Include", "Use STEP weight"]:
                         if col in df_parts.columns:
-                            df_parts[col] = df_parts[col].astype(bool)
-
+                            try:
+                                df_parts[col] = df_parts[col].astype(bool)
+                            except Exception:
+                                pass
                     st.session_state["step_parts_df"] = df_parts
                     st.session_state["step_parts_signature"] = sig
 
                 st.markdown("#### STEP parts")
                 st.caption(
-                    "Select the parts you want to add to the estimate. "
-                    "BBox/Volume/Weight are extracted from STEP. Smallest bbox dimension is treated as thickness; "
-                    "the other two are width/length. Material/Thickness/Qty are editable."
+                    "Edit Qty / Material / Thickness. Uncheck 'Use STEP weight' if you want to use plate-calculated weight instead."
                 )
 
-                # ✅ Always render from the persisted dataframe
                 df_parts = st.session_state["step_parts_df"]
 
                 edited = st.data_editor(
@@ -490,8 +540,44 @@ def page_plate() -> None:
                     },
                 )
 
-                # ✅ Persist edits so checkbox changes stick across reruns
+                # Persist edits so checkbox changes stick
                 st.session_state["step_parts_df"] = edited
+
+                st.markdown("**Load STEP row into Plate inputs (below)**")
+                try:
+                    if not edited.empty:
+                        labels = [
+                            f"{r['Source File']} :: {r['Part Name']} (id={r['Row ID']})"
+                            for _, r in edited.iterrows()
+                        ]
+                        sel = st.selectbox("Select a STEP row to load", options=labels, key="step_load_select")
+                        if st.button("Load selected STEP row into Plate form", key="step_load_to_plate_btn"):
+                            row_id = sel.split("id=")[-1].rstrip(")").strip()
+                            row = edited[edited["Row ID"] == row_id].iloc[0].to_dict()
+
+                            st.session_state["plate_part_name"] = str(row.get("Part Name", "STEP Part"))
+                            st.session_state["plate_qty"] = int(row.get("Qty", 1) or 1)
+                            st.session_state["plate_w"] = float(row.get("BBox W (in)", 0.0) or 0.0)
+                            st.session_state["plate_l"] = float(row.get("BBox L (in)", 0.0) or 0.0)
+                            st.session_state["plate_step_volume_in3"] = float(row.get("Volume (in³)", 0.0) or 0.0)
+                            st.session_state["plate_step_weight_lbs"] = float(row.get("Weight (lb)", 0.0) or 0.0)
+                            st.session_state["plate_step_bbox_h_in"] = float(row.get("Inferred Thickness (in)", 0.0) or 0.0)
+                            st.session_state["plate_step_loaded_name"] = str(row.get("Source File", ""))
+
+                            # update keyed selectboxes if possible
+                            try:
+                                st.session_state["plate_mat"] = str(row.get("Material", logic.MATERIALS_LIST[0]))
+                            except Exception:
+                                pass
+                            try:
+                                st.session_state["plate_thk"] = float(row.get("Thickness (in)", logic.THICKNESS_LIST[0]))
+                            except Exception:
+                                pass
+
+                            st.success("Loaded STEP row into Plate inputs below. Add drilling/rolling and click 'Add plate'.")
+                            st.rerun()
+                except Exception:
+                    pass
 
                 with st.expander("Preview a selected part (optional)", expanded=False):
                     try:
@@ -499,13 +585,13 @@ def page_plate() -> None:
                         if selectable.empty:
                             st.info("Select at least one part (Include = true) to preview.")
                         else:
-                            labels = [
+                            labels2 = [
                                 f"{r['Source File']} :: {r['Part Name']} (id={r['Row ID']})"
                                 for _, r in selectable.iterrows()
                             ]
-                            sel = st.selectbox("Choose a part to preview", options=labels, key="step_preview_select_multi")
-                            row_id = sel.split("id=")[-1].rstrip(")").strip()
-                            mesh = mesh_cache.get(row_id)
+                            sel2 = st.selectbox("Choose a part to preview", options=labels2, key="step_preview_select_multi")
+                            row_id2 = sel2.split("id=")[-1].rstrip(")").strip()
+                            mesh = mesh_cache.get(row_id2)
                             if mesh is None:
                                 st.warning("Preview mesh not available for this part.")
                             else:
@@ -514,7 +600,7 @@ def page_plate() -> None:
                     except Exception as e:
                         st.warning(f"Preview failed: {e}")
 
-                add_selected = st.button("Add selected STEP parts to estimate", type="primary", key="step_add_selected_multi")
+                add_selected = st.button("Add selected STEP parts to estimate (no drilling/rolling)", type="secondary", key="step_add_selected_multi")
                 if add_selected:
                     added_n = 0
                     for _, r in edited.iterrows():
@@ -539,9 +625,8 @@ def page_plate() -> None:
                             bend_time_item = 0.0
 
                             net_weight_item = logic.calculate_plate_net_weight(
-                                thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION
+                                thickness, width, length, getattr(logic, "DENSITY_FACTOR_FOR_CALCULATION", 0.283)
                             )
-
                             use_step_weight = bool(r.get("Use STEP weight", True))
                             step_weight = float(r.get("Weight (lb)", 0.0) or 0.0)
                             step_volume = float(r.get("Volume (in³)", 0.0) or 0.0)
@@ -572,6 +657,12 @@ def page_plate() -> None:
                                 "Drill Details Summary": drill_summary_str,
                                 "Burning Time (min/item)": float(burn_time_item),
                                 "Bend Time (min/item)": float(bend_time_item),
+                                "Rolling Required": "No",
+                                "Rolling Type": "",
+                                "Rolling OD Bucket": "",
+                                "Rolling Prebend": "",
+                                "Rolling Tight Tolerance": "",
+                                "Rolling Time (min/item)": 0.0,
                                 "Net Weight (lbs/item)": round(net_weight_item, 2),
                                 "Gross Weight (lbs/item)": round(gross_weight_item, 2),
                                 "Fit Time (min/item)": float(fit_time_item),
@@ -580,7 +671,7 @@ def page_plate() -> None:
                                 "STEP BBox H (in)": bbox_h,
                                 "STEP Source File": source_file,
                                 "Total Gross Weight (lbs)": round(gross_weight_item * qty, 2),
-                                "Total Burning Run Time (min)": round(burn_time_item * qty, 2),
+                                "Total Burning Time (min)": round(burn_time_item * qty, 2),
                                 "Total Drilling Time (min)": 0.0,
                                 "Total Bend Time (min)": 0.0,
                                 "Total Rolling Run Time (min)": 0.0,
@@ -601,15 +692,15 @@ def page_plate() -> None:
     # ------------------------------------------------------------
     with st.expander("DXF Batch Import (Plate Only)", expanded=False):
         st.caption(
-            "Upload one or more DXF files and we'll auto-detect plate size, true cut perimeter, and holes. "
-            "Then enter thickness/material/qty and add to the estimate."
+            "Upload one or more DXF files. We detect plate size and cut perimeter. "
+            "Then you can edit thickness/material/qty and add to the estimate."
         )
 
         up_cols = st.columns([1, 1, 1, 2])
         with up_cols[0]:
-            dxf_units = st.selectbox("DXF units", options=["Inches", "mm"], index=0)
+            dxf_units = st.selectbox("DXF units", options=["Inches", "mm"], index=0, key="dxf_units")
         with up_cols[1]:
-            flatten_tol = st.number_input("Curve tolerance (in)", min_value=0.001, value=0.01, step=0.001)
+            flatten_tol = st.number_input("Curve tolerance (in)", min_value=0.001, value=0.01, step=0.001, key="dxf_flatten_tol")
         with up_cols[2]:
             dxf_scale = st.number_input(
                 "Scale multiplier",
@@ -617,23 +708,26 @@ def page_plate() -> None:
                 value=1.0,
                 step=0.1,
                 help="Applied after unit conversion. Example: if DXF geometry is at 1/8 scale, enter 8.0.",
+                key="dxf_scale",
             )
         with up_cols[3]:
             ignore_layers_text = st.text_input(
                 "Ignore layers containing (comma-separated)",
                 value="ETCH,SCRIBE,ENGRAVE,MARK,TEXT,DIM,CENTER,CL",
+                key="dxf_ignore_layers",
             )
 
         strict_single = st.checkbox(
             "Strict single-part mode (fail if multiple outer profiles are found)",
             value=False,
-            help="When enabled, the DXF import will error if the file appears to contain multiple parts / outer profiles.",
+            key="dxf_strict_single",
         )
 
         uploaded = st.file_uploader(
             "Upload DXF files",
             type=["dxf", "DXF"],
             accept_multiple_files=True,
+            key="dxf_upload_multi",
         )
 
         if uploaded:
@@ -689,31 +783,18 @@ def page_plate() -> None:
                     use_container_width=True,
                     num_rows="fixed",
                     column_config={
-                        "Preview": st.column_config.ImageColumn(
-                            "Preview",
-                            help="Auto-rendered thumbnail of the detected profile.",
-                            width="small",
-                        ),
+                        "Preview": st.column_config.ImageColumn("Preview", width="small"),
                         "Thickness (in)": st.column_config.SelectboxColumn(
-                            "Thickness (in)",
-                            options=[float(x) for x in logic.THICKNESS_LIST],
-                            required=True,
+                            "Thickness (in)", options=[float(x) for x in logic.THICKNESS_LIST], required=True
                         ),
                         "Grade": st.column_config.SelectboxColumn(
-                            "Grade",
-                            options=[str(x) for x in logic.MATERIALS_LIST],
-                            required=True,
+                            "Grade", options=[str(x) for x in logic.MATERIALS_LIST], required=True
                         ),
-                        "Quantity": st.column_config.NumberColumn(
-                            "Quantity",
-                            min_value=1,
-                            step=1,
-                            required=True,
-                        ),
+                        "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
                     },
                 )
 
-                add_all = st.button("Add all detected plate parts to estimate")
+                add_all = st.button("Add all detected plate parts to estimate", key="dxf_add_all")
                 if add_all:
                     added_n = 0
                     for _, r in edited.iterrows():
@@ -732,11 +813,10 @@ def page_plate() -> None:
                             drilling_time_item = 0.0
                             drill_summary_str = ""
                             burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
-
                             bend_time_item = 0.0
 
                             net_weight_item = logic.calculate_plate_net_weight(
-                                thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION
+                                thickness, width, length, getattr(logic, "DENSITY_FACTOR_FOR_CALCULATION", 0.283)
                             )
                             gross_weight_item = logic.calculate_gross_weight(net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
                             fit_time_item = logic.calculate_fit_time(net_weight_item)
@@ -758,16 +838,20 @@ def page_plate() -> None:
                                 "Drill Details Summary": drill_summary_str,
                                 "Burning Time (min/item)": float(burn_time_item),
                                 "Bend Time (min/item)": float(bend_time_item),
+                                "Rolling Required": "No",
+                                "Rolling Type": "",
+                                "Rolling OD Bucket": "",
+                                "Rolling Prebend": "",
+                                "Rolling Tight Tolerance": "",
+                                "Rolling Time (min/item)": 0.0,
                                 "Net Weight (lbs/item)": round(net_weight_item, 2),
                                 "Gross Weight (lbs/item)": round(gross_weight_item, 2),
                                 "Fit Time (min/item)": float(fit_time_item),
-                                "STEP Volume (in^3)": float(st.session_state.get("plate_step_volume_in3", 0.0) or 0.0),
-                                "STEP Weight (lbs/item)": float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0),
-                                "STEP BBox H (in)": float(st.session_state.get("plate_step_bbox_h_in", 0.0) or 0.0),
                                 "Total Gross Weight (lbs)": round(gross_weight_item * quantity, 2),
                                 "Total Burning Time (min)": round(burn_time_item * quantity, 2),
-                                "Total Drilling Time (min)": round(drilling_time_item * quantity, 2),
-                                "Total Bend Time (min)": round(bend_time_item * quantity, 2),
+                                "Total Drilling Time (min)": 0.0,
+                                "Total Bend Time (min)": 0.0,
+                                "Total Rolling Run Time (min)": 0.0,
                                 "Total Fit Time (min)": round(fit_time_item * quantity, 2),
                                 "DXF Source": str(r.get("Source DXF", "")),
                                 "DXF Hole Count": int(r.get("Hole Count", 0)),
@@ -783,8 +867,11 @@ def page_plate() -> None:
                         st.success(f"Added {added_n} plate part(s) from DXF.")
                         st.rerun()
             else:
-                st.warning("No closed profiles were detected in the uploaded DXFs (or everything was filtered out by ignored layers).")
+                st.warning("No closed profiles detected in uploaded DXFs (or filtered out by ignored layers).")
 
+    # ------------------------------------------------------------
+    # Manual Plate entry (supports drilling + rolling)
+    # ------------------------------------------------------------
     with st.form("plate_form"):
         c1, c2 = st.columns(2)
         with c1:
@@ -811,20 +898,44 @@ def page_plate() -> None:
         st.markdown("#### Drilling (optional)")
         d1, d2, d3 = st.columns(3)
         with d1:
-            hole_dia_1 = st.number_input('Hole 1 dia (in)', min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_1 = st.number_input('Hole 1 qty', min_value=0, value=0, step=1)
+            hole_dia_1 = st.number_input("Hole 1 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+            hole_qty_1 = st.number_input("Hole 1 qty", min_value=0, value=0, step=1)
         with d2:
-            hole_dia_2 = st.number_input('Hole 2 dia (in)', min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_2 = st.number_input('Hole 2 qty', min_value=0, value=0, step=1)
+            hole_dia_2 = st.number_input("Hole 2 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+            hole_qty_2 = st.number_input("Hole 2 qty", min_value=0, value=0, step=1)
         with d3:
-            hole_dia_3 = st.number_input('Hole 3 dia (in)', min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_3 = st.number_input('Hole 3 qty', min_value=0, value=0, step=1)
+            hole_dia_3 = st.number_input("Hole 3 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+            hole_qty_3 = st.number_input("Hole 3 qty", min_value=0, value=0, step=1)
+
+        st.markdown("#### Rolling (optional)")
+        rolling_required = st.checkbox("Rolling required", value=False, key="plate_roll_required")
+        rolling_type = "Cylinder"
+        rolling_od_bucket = "Large OD (easiest)"
+        rolling_prebend = False
+        rolling_tight_tol = False
+
+        if rolling_required:
+            r1, r2, r3, r4 = st.columns([1, 1, 1, 1])
+            with r1:
+                rolling_type = st.selectbox("Rolling type", ["Cylinder", "Cone"], index=0, key="plate_roll_type")
+            with r2:
+                rolling_od_bucket = st.selectbox(
+                    "OD bucket",
+                    ["Small OD (<24\")", "Medium OD (24–60\")", "Large OD (60\"+)"],
+                    index=2,
+                    key="plate_roll_od",
+                )
+            with r3:
+                rolling_prebend = st.checkbox("Prebend", value=False, key="plate_roll_prebend")
+            with r4:
+                rolling_tight_tol = st.checkbox("Tight tolerance", value=False, key="plate_roll_tighttol")
 
         st.markdown("#### STEP Weight (optional)")
         use_step_weight = st.checkbox(
             "Use STEP-derived weight for fit time (and reporting)",
             value=bool(st.session_state.get("plate_step_weight_lbs", 0.0) > 0),
-            help="If enabled and a STEP file was loaded, the app will use STEP weight instead of plate formula weight for fit time + totals weight.",
+            help="If enabled and a STEP file was loaded, the app uses STEP weight instead of plate formula weight.",
+            key="plate_use_step_weight_manual",
         )
 
         add = st.form_submit_button("Add plate to estimate")
@@ -842,18 +953,39 @@ def page_plate() -> None:
         burn_machine = logic.get_plate_burn_machine_type(thickness)
         perimeter = logic.calculate_plate_perimeter(width, length)
         feedrate = logic.get_feedrate_for_thickness(thickness, logic.FEEDRATE_TABLE_IPM)
+
         drilling_time_item, drill_summary_str = logic.process_plate_drilling_data(fake_form, thickness)
         burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
-        bend_time_item = round(logic.calculate_bend_time(int(num_bends), bend_complexity, logic.BEND_TIME_PER_COMPLEXITY_MINUTES), 2)
-        net_weight_item = logic.calculate_plate_net_weight(thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION)
+        bend_time_item = round(
+            logic.calculate_bend_time(int(num_bends), bend_complexity, logic.BEND_TIME_PER_COMPLEXITY_MINUTES),
+            2,
+        )
 
-        if 'use_step_weight' in locals() and use_step_weight:
+        # Base plate weight (formula)
+        net_weight_item = logic.calculate_plate_net_weight(
+            thickness, width, length, getattr(logic, "DENSITY_FACTOR_FOR_CALCULATION", 0.283)
+        )
+
+        # Optional override from STEP
+        if use_step_weight:
             step_wt = float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0)
             if step_wt > 0:
                 net_weight_item = step_wt
 
         gross_weight_item = logic.calculate_gross_weight(net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
         fit_time_item = logic.calculate_fit_time(net_weight_item)
+
+        rolling_time_item = 0.0
+        total_rolling_time = 0.0
+        if rolling_required:
+            rolling_time_item = _rolling_time_minutes_per_item(
+                weight_lbs=net_weight_item,
+                rolling_type=rolling_type,
+                od_bucket=rolling_od_bucket,
+                prebend=rolling_prebend,
+                tight_tolerance=rolling_tight_tol,
+            )
+            total_rolling_time = round(float(rolling_time_item) * int(quantity), 2)
 
         part = {
             "Estimation Type": "Plate",
@@ -872,20 +1004,30 @@ def page_plate() -> None:
             "Drill Details Summary": drill_summary_str,
             "Burning Time (min/item)": float(burn_time_item),
             "Bend Time (min/item)": float(bend_time_item),
+            "Rolling Required": "Yes" if rolling_required else "No",
+            "Rolling Type": rolling_type if rolling_required else "",
+            "Rolling OD Bucket": rolling_od_bucket if rolling_required else "",
+            "Rolling Prebend": "Yes" if (rolling_required and rolling_prebend) else "No" if rolling_required else "",
+            "Rolling Tight Tolerance": "Yes" if (rolling_required and rolling_tight_tol) else "No" if rolling_required else "",
+            "Rolling Time (min/item)": float(rolling_time_item),
             "Net Weight (lbs/item)": round(net_weight_item, 2),
             "Gross Weight (lbs/item)": round(gross_weight_item, 2),
             "Fit Time (min/item)": float(fit_time_item),
             "STEP Volume (in^3)": float(st.session_state.get("plate_step_volume_in3", 0.0) or 0.0),
             "STEP Weight (lbs/item)": float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0),
             "STEP BBox H (in)": float(st.session_state.get("plate_step_bbox_h_in", 0.0) or 0.0),
-            "Total Gross Weight (lbs)": round(gross_weight_item * quantity, 2),
-            "Total Burning Time (min)": round(burn_time_item * quantity, 2),
-            "Total Drilling Time (min)": round(drilling_time_item * quantity, 2),
-            "Total Bend Time (min)": round(bend_time_item * quantity, 2),
-            "Total Fit Time (min)": round(fit_time_item * quantity, 2),
+            "STEP Source File": str(st.session_state.get("plate_step_loaded_name", "")),
+            "Total Gross Weight (lbs)": round(gross_weight_item * int(quantity), 2),
+            "Total Burning Time (min)": round(burn_time_item * int(quantity), 2),
+            "Total Drilling Time (min)": round(drilling_time_item * int(quantity), 2),
+            "Total Bend Time (min)": round(bend_time_item * int(quantity), 2),
+            "Total Rolling Run Time (min)": float(total_rolling_time),
+            "Total Fit Time (min)": round(fit_time_item * int(quantity), 2),
         }
+
         _add_part(part)
         st.success("Plate added.")
+        st.rerun()
 
 
 def page_structural() -> None:
@@ -906,11 +1048,7 @@ def page_structural() -> None:
     with c1:
         part_name = st.text_input("Part name", value="Unnamed Structural")
         quantity = st.number_input("Quantity", min_value=1, value=1, step=1)
-        structural_type = st.selectbox(
-            "Type",
-            options=structural_types,
-            key="struct_type",
-        )
+        structural_type = st.selectbox("Type", options=structural_types, key="struct_type")
     with c2:
         labels = logic.AISC_TYPES_TO_LABELS_MAP.get(structural_type, [])
         _cleanup_old_shape_keys(structural_type)
@@ -919,23 +1057,27 @@ def page_structural() -> None:
         if labels and shape_key not in st.session_state:
             st.session_state[shape_key] = labels[0]
         shape_label = st.selectbox("Shape", options=labels, key=shape_key)
+
         length_in = st.number_input("Length (in)", min_value=0.0, value=0.0, step=1.0)
         is_mitered = st.checkbox("Mitered cut")
 
-    add = st.button("Add structural to estimate")
-
+    add = st.button("Add structural to estimate", key="struct_add_btn")
     if add:
         props = logic.AISC_LABEL_TO_PROPERTIES_MAP.get(shape_label, {})
-        weight_per_foot = float(props.get("W_float", 0.0))
-        area_sq_in = float(props.get("A_float", 0.0))
+        weight_per_foot = float(props.get("W_float", 0.0) or 0.0)
+        area_sq_in = float(props.get("A_float", 0.0) or 0.0)
+
         end_perim_one = _structural_end_perimeter_one_end_in(props)
         end_perim_both = 2.0 * float(end_perim_one)
 
         net_wt = logic.calculate_structural_piece_weight(weight_per_foot, length_in)
         gross_wt = logic.calculate_gross_weight(net_wt, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
         fit_t = logic.calculate_fit_time(net_wt)
+
         cut_t = logic.calculate_structural_cutting_time(
-            area_sq_in, logic.STRUCTURAL_CUTTING_RATE_SQ_IN_PER_MIN, logic.STRUCTURAL_TRAVEL_TIME_PER_PIECE_MIN
+            area_sq_in,
+            logic.STRUCTURAL_CUTTING_RATE_SQ_IN_PER_MIN,
+            logic.STRUCTURAL_TRAVEL_TIME_PER_PIECE_MIN,
         )
         if is_mitered:
             cut_t *= logic.MITER_CUT_MULTIPLIER
@@ -949,32 +1091,25 @@ def page_structural() -> None:
             "Length (in)": float(length_in),
             "Mitered Cut": "Yes" if is_mitered else "No",
             "End Perimeter Both Ends (in/item)": round(end_perim_both, 2),
-            "Total End Perimeter Both Ends (in)": round(end_perim_both * quantity, 2),
+            "Total End Perimeter Both Ends (in)": round(end_perim_both * int(quantity), 2),
             "Weight per Foot (lbs/ft)": weight_per_foot,
             "Cross-sectional Area (in^2)": area_sq_in,
             "Net Weight (lbs/item)": round(net_wt, 2),
             "Gross Weight (lbs/item)": round(gross_wt, 2),
             "Fit Time (min/item)": float(fit_t),
             "Cutting Time (min/item)": round(cut_t, 2),
-            "Total Gross Weight (lbs)": round(gross_wt * quantity, 2),
-            "Total Cutting Time (min)": round(cut_t * quantity, 2),
-            "Total Fit Time (min)": round(fit_t * quantity, 2),
-            "Burn Machine Type": "N/A",
-            "Burning Time (min/item)": 0.0,
-            "Total Burning Time (min)": 0.0,
-            "Bend Time (min/item)": 0.0,
-            "Total Bend Time (min)": 0.0,
-            "Drilling Time (min/item)": 0.0,
-            "Total Drilling Time (min)": 0.0,
-            "Drill Details Summary": "N/A",
+            "Total Gross Weight (lbs)": round(gross_wt * int(quantity), 2),
+            "Total Cutting Time (min)": round(cut_t * int(quantity), 2),
+            "Total Fit Time (min)": round(fit_t * int(quantity), 2),
         }
         _add_part(part)
         st.success("Structural added.")
+        st.rerun()
 
 
 def page_welding() -> None:
     st.header("Welding")
-    st.caption("Enter welds (up to 50). Add as a single summary line to the estimate.")
+    st.caption("Enter welds (up to 10 shown here). Adds a single welding summary line to the estimate.")
 
     with st.form("weld_form"):
         weld_entries = []
@@ -1021,10 +1156,12 @@ def page_welding() -> None:
             "Total Drilling Time (min)": 0.0,
             "Total Bend Time (min)": 0.0,
             "Total Cutting Time (min)": 0.0,
+            "Total Rolling Run Time (min)": 0.0,
             "Total Fit Time (min)": 0.0,
         }
         _add_part(part)
         st.success("Welding summary added.")
+        st.rerun()
 
 
 def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1036,16 +1173,15 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     laser_burn_t = 0.0
     kinetic_burn_t = 0.0
     drill_t = 0.0
+    roll_t = 0.0
     weld_time_hr = 0.0
     weld_wire_lbs = 0.0
     perimeter_total_in = 0.0
     structural_end_perimeter_total_in = 0.0
 
-    has_plate = any(r.get("Estimation Type") == "Plate" for r in rows)
-    has_struct = any(r.get("Estimation Type") == "Structural" for r in rows)
-
     for r in rows:
         fit_t += float(r.get("Total Fit Time (min)", 0.0) or 0.0)
+        roll_t += float(r.get("Total Rolling Run Time (min)", 0.0) or 0.0)
 
         try:
             per_item = float(r.get("Perimeter (in/item)", 0.0) or 0.0)
@@ -1063,10 +1199,12 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 laser_burn_t += float(r.get("Total Burning Time (min)", 0.0) or 0.0)
             elif r.get("Burn Machine Type") == "Kinetic":
                 kinetic_burn_t += float(r.get("Total Burning Time (min)", 0.0) or 0.0)
+
         elif etype == "Structural":
             struct_wt += float(r.get("Total Gross Weight (lbs)", 0.0) or 0.0)
             structural_end_perimeter_total_in += float(r.get("Total End Perimeter Both Ends (in)", 0.0) or 0.0)
             str_cut_t += float(r.get("Total Cutting Time (min)", 0.0) or 0.0)
+
         elif etype == "Welding":
             weld_time_hr += float(r.get("Total Weld Time (hours)", 0.0) or 0.0)
             weld_wire_lbs += float(r.get("Total Weld Wire (lbs)", 0.0) or 0.0)
@@ -1079,16 +1217,14 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "grand_total_plate_drilling_time": drill_t,
         "grand_total_plate_bend_time": plt_bend_t,
         "grand_total_structural_cutting_time": str_cut_t,
-        "grand_total_saw_time": str_cut_t,
         "grand_total_fit_time": fit_t,
+        "grand_total_roll_time": roll_t,
         "grand_total_weld_time_hours": weld_time_hr,
         "grand_total_weld_wire_lbs": weld_wire_lbs,
-        "grand_total_perimeter_in": perimeter_total_in,
+        "grand_total_plate_perimeter_in": perimeter_total_in,
         "grand_total_structural_end_perimeter_in": structural_end_perimeter_total_in,
         "grand_total_combined_perimeter_in": perimeter_total_in + structural_end_perimeter_total_in,
         "combined_overall_gross_weight": plate_wt + struct_wt,
-        "has_plate_entries": has_plate,
-        "has_structural_entries": has_struct,
     }
 
 
@@ -1104,36 +1240,21 @@ def page_summary() -> None:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total gross weight (lbs)", f"{totals['combined_overall_gross_weight']:.2f}")
     c2.metric("Total fit time (min)", f"{totals['grand_total_fit_time']:.2f}")
-    c3.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
-    c4.metric("Plate perimeter (in)", f"{totals['grand_total_perimeter_in']:.2f}")
+    c3.metric("Roll time (min)", f"{totals['grand_total_roll_time']:.2f}")
+    c4.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
 
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Structural end perimeter (in)", f"{totals.get('grand_total_structural_end_perimeter_in', 0.0):.2f}")
-    p2.metric("Combined perimeter (in)", f"{totals.get('grand_total_combined_perimeter_in', totals['grand_total_perimeter_in']):.2f}")
-    p3.metric("Total plate weight (lbs)", f"{totals['plate_total_gross_weight']:.2f}")
-    p4.metric("Total structural weight (lbs)", f"{totals['structural_total_gross_weight']:.2f}")
+    p1, p2, p3 = st.columns(3)
+    p1.metric("Plate cut perimeter (in)", f"{totals['grand_total_plate_perimeter_in']:.2f}")
+    p2.metric("Structural end perimeter (in)", f"{totals['grand_total_structural_end_perimeter_in']:.2f}")
+    p3.metric("Combined perimeter (in)", f"{totals['grand_total_combined_perimeter_in']:.2f}")
 
     t1, t2, t3 = st.columns(3)
-    t1.metric("Saw time (min)", f"{totals.get('grand_total_saw_time', totals.get('grand_total_structural_cutting_time', 0.0)):.2f}")
-    t2.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
-    t3.metric("Kinetic time (min)", f"{totals['grand_total_kinetic_burn_time']:.2f}")
+    t1.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
+    t2.metric("Kinetic time (min)", f"{totals['grand_total_kinetic_burn_time']:.2f}")
+    t3.metric("Plate drilling (min)", f"{totals['grand_total_plate_drilling_time']:.2f}")
 
-    with st.expander("More totals", expanded=False):
-        st.write(
-            {
-                "Laser burn (min)": round(totals["grand_total_laser_burn_time"], 2),
-                "Kinetic burn (min)": round(totals["grand_total_kinetic_burn_time"], 2),
-                "Plate drilling (min)": round(totals["grand_total_plate_drilling_time"], 2),
-                "Plate bend (min)": round(totals["grand_total_plate_bend_time"], 2),
-                "Saw time (min)": round(totals.get("grand_total_saw_time", totals.get("grand_total_structural_cutting_time", 0.0)), 2),
-                "Weld wire (lbs)": round(totals["grand_total_weld_wire_lbs"], 2),
-                "Plate perimeter (in)": round(totals["grand_total_perimeter_in"], 2),
-                "Structural end perimeter (in)": round(totals.get("grand_total_structural_end_perimeter_in", 0.0), 2),
-                "Combined perimeter (in)": round(totals.get("grand_total_combined_perimeter_in", totals["grand_total_perimeter_in"]), 2),
-            }
-        )
-
-    st.dataframe(rows, use_container_width=True)
+    with st.expander("Estimate line items", expanded=False):
+        st.dataframe(rows, use_container_width=True)
 
     csv_bytes = _export_csv_bytes(rows)
     st.download_button(
@@ -1155,14 +1276,13 @@ def main() -> None:
 
     with st.sidebar:
         st.title(APP_TITLE)
-        st.caption("Password-protected Streamlit app")
         page = st.radio("Go to", ["Plate", "Structural", "Welding", "Summary"], index=0, key="nav_page")
         st.write("—")
         st.write(f"Items in estimate: **{len(st.session_state['estimate_parts'])}**")
-        if st.button("Clear estimate", type="secondary"):
+        if st.button("Clear estimate", type="secondary", key="clear_estimate_btn"):
             _clear_estimate()
             st.rerun()
-        if st.button("Sign out", type="secondary"):
+        if st.button("Sign out", type="secondary", key="sign_out_btn"):
             st.session_state["authenticated"] = False
             st.rerun()
 
