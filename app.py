@@ -1137,6 +1137,192 @@ def page_structural() -> None:
         st.rerun()
 
 
+    # ------------------------------------------------------------
+    # Structural nesting / bar optimization (mix of multiple stock lengths)
+    # ------------------------------------------------------------
+    with st.expander("Structural nesting optimization (bar cutting)", expanded=False):
+        st.caption(
+            "Uses the Structural items currently in your estimate (their lengths × quantities) and optimizes bar usage. "
+            "Supports mixing multiple stock lengths and optional quantity limits per stock length."
+        )
+
+        # Gather structural cuts from the estimate
+        rows = st.session_state.get("estimate_parts", [])
+        cuts_with_qty = []
+        for r in rows:
+            if r.get("Estimation Type") != "Structural":
+                continue
+            try:
+                ln = float(r.get("Length (in)", 0.0) or 0.0)
+                qty = int(r.get("Quantity", 0) or 0)
+                if ln > 0 and qty > 0:
+                    cuts_with_qty.append({"length": ln, "qty": qty, "name": str(r.get("Part Name", ""))})
+            except Exception:
+                continue
+
+        if not cuts_with_qty:
+            st.info("No Structural items in the estimate yet. Add structural parts above, then come back to optimize bar usage.")
+        else:
+            cA, cB, cC = st.columns([1.4, 1, 1])
+            with cA:
+                stock_text = st.text_area(
+                    "Stock length options (one per line)",
+                    value="480\n240\n120",
+                    height=120,
+                    help=(
+                        "Enter inches. Formats supported:\n"
+                        "• 480\n"
+                        "• 480, qty=10\n"
+                        "• 480, qty=10, cost=125.00\n"
+                        "If qty is omitted or 0, it is treated as unlimited."
+                    ),
+                    key="struct_stock_options_text",
+                )
+            with cB:
+                kerf = st.number_input(
+                    "Kerf per cut (in)",
+                    min_value=0.0,
+                    value=0.125,
+                    step=0.01,
+                    help="Approximate material lost per piece cut off the bar (saw kerf).",
+                    key="struct_kerf",
+                )
+                end_trim = st.number_input(
+                    "End trim / clamp (in)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.25,
+                    help="Reserved length per bar for clamping/trim.",
+                    key="struct_end_trim",
+                )
+            with cC:
+                objective = st.selectbox(
+                    "Optimization objective",
+                    options=["waste", "bars", "cost", "balanced"],
+                    index=0,
+                    help=(
+                        "waste: minimize total drop\n"
+                        "bars: minimize bar count\n"
+                        "cost: minimize total bar cost (requires cost= on stock lines)\n"
+                        "balanced: strongly prefers fewer bars, then waste"
+                    ),
+                    key="struct_objective",
+                )
+                trials = st.number_input(
+                    "Randomized trials",
+                    min_value=50,
+                    max_value=5000,
+                    value=600,
+                    step=50,
+                    help="More trials can improve utilization but may run slightly slower.",
+                    key="struct_trials",
+                )
+
+            def _parse_stock_options(text: str):
+                opts = []
+                for raw in (text or "").splitlines():
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    # Allow commas or spaces
+                    parts = [p.strip() for p in line.replace(";", ",").split(",") if p.strip()]
+                    try:
+                        L = float(parts[0])
+                    except Exception:
+                        continue
+                    qty = None
+                    cost = None
+                    for p in parts[1:]:
+                        pl = p.lower().replace(" ", "")
+                        if pl.startswith("qty="):
+                            try:
+                                qv = int(float(pl.split("=", 1)[1]))
+                                qty = None if qv <= 0 else qv
+                            except Exception:
+                                pass
+                        elif pl.startswith("cost="):
+                            try:
+                                cost = float(pl.split("=", 1)[1])
+                            except Exception:
+                                pass
+                        else:
+                            # Support "480 10" meaning length, qty
+                            try:
+                                if qty is None:
+                                    qv = int(float(p))
+                                    qty = None if qv <= 0 else qv
+                            except Exception:
+                                pass
+                    opts.append({"length": L, "qty": qty, "cost": cost})
+                return opts
+
+            stock_options = _parse_stock_options(stock_text)
+
+            # Quick preview of what we're optimizing
+            with st.expander("Cuts being optimized", expanded=False):
+                df_cuts = pd.DataFrame(
+                    [{"Part": c.get("name", ""), "Length (in)": c["length"], "Qty": c["qty"]} for c in cuts_with_qty]
+                )
+                st.dataframe(df_cuts, use_container_width=True)
+
+            run_opt = st.button("Run structural nesting optimization", type="primary", key="run_struct_nesting")
+            if run_opt:
+                sol = logic.optimize_structural_nesting_mix(
+                    cuts_with_qty=[{"length": c["length"], "qty": c["qty"]} for c in cuts_with_qty],
+                    stock_options=stock_options,
+                    kerf=float(kerf),
+                    end_trim=float(end_trim),
+                    objective=str(objective),
+                    n_trials=int(trials),
+                    seed=13,
+                )
+                st.session_state["structural_yield_results"] = sol
+
+            sol = st.session_state.get("structural_yield_results") or {}
+            if sol and sol.get("bars"):
+                totals = sol.get("totals", {})
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Bars used", f"{int(totals.get('bars_used', 0) or 0)}")
+                m2.metric("Total waste (in)", f"{float(totals.get('total_waste', 0.0) or 0.0):.2f}")
+                m3.metric("Utilization", f"{float(totals.get('utilization', 0.0) or 0.0) * 100.0:.2f}%")
+                m4.metric("Total cost", f"${float(totals.get('total_cost', 0.0) or 0.0):.2f}")
+
+                by_stock = sol.get("by_stock", [])
+                if by_stock:
+                    df_by = pd.DataFrame([
+                        {
+                            "Stock length (in)": r.get("stock_len"),
+                            "Bars": r.get("bars"),
+                            "Used (in)": round(float(r.get("total_used", 0.0) or 0.0), 2),
+                            "Waste (in)": round(float(r.get("total_waste", 0.0) or 0.0), 2),
+                            "Utilization %": round(float(r.get("utilization", 0.0) or 0.0) * 100.0, 2),
+                        }
+                        for r in by_stock
+                    ])
+                    st.subheader("Best mix by stock length")
+                    st.dataframe(df_by, use_container_width=True)
+
+                with st.expander("Bar-by-bar cut plan", expanded=False):
+                    bars = sol.get("bars", [])
+                    df_bars = pd.DataFrame([
+                        {
+                            "Bar #": i + 1,
+                            "Stock (in)": b.get("stock_len"),
+                            "Cuts (in)": ", ".join([str(round(float(x), 3)) for x in b.get("cuts", [])]),
+                            "Used (in)": round(float(b.get("used_len", 0.0) or 0.0), 2),
+                            "Waste (in)": round(float(b.get("waste", 0.0) or 0.0), 2),
+                        }
+                        for i, b in enumerate(bars)
+                    ])
+                    st.dataframe(df_bars, use_container_width=True)
+
+                if sol.get("infeasible_cuts"):
+                    st.warning(
+                        "Some cuts could not fit into any provided stock length (after trim/kerf). "
+                        f"Lengths (in): {sorted([round(float(x), 3) for x in sol.get('infeasible_cuts', [])])}"
+                    )
+
+
 def page_welding() -> None:
     st.header("Welding")
     st.caption("Enter welds (up to 10 shown here). Adds a single welding summary line to the estimate.")
