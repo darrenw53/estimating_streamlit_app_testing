@@ -40,6 +40,10 @@ def _init_state() -> None:
     st.session_state.setdefault("plate_step_bbox_h_in", 0.0)
     st.session_state.setdefault("plate_step_loaded_name", "")
 
+    # ✅ Persist STEP parts table edits so checkboxes don't snap back on rerun
+    st.session_state.setdefault("step_parts_df", None)
+    st.session_state.setdefault("step_parts_signature", None)
+
 
 def _get_password_from_secrets_or_env() -> str:
     """Return app password from Streamlit secrets (preferred) or env var as fallback."""
@@ -134,7 +138,6 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     if not rows:
         return b""
 
-    # Build stable header order (match your Flask export ordering as much as possible)
     preferred_order = [
         "Estimation Type",
         "Part Name",
@@ -178,7 +181,6 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     header = [k for k in preferred_order if k in all_keys] + sorted([k for k in all_keys if k not in preferred_order])
 
     import csv
-
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=header, extrasaction="ignore")
     w.writeheader()
@@ -191,15 +193,12 @@ def _structural_end_perimeter_one_end_in(props: Dict[str, Any]) -> float:
     """Approximate end perimeter (inches) for ONE end of a structural shape from AISC props."""
     shape = str(props.get("Shape", "") or props.get("Type", "") or "").upper()
 
-    # HSS / Tube / Pipe
     if "HSS" in shape:
-        # Rectangular HSS: use B and Ht if available
         b = float(props.get("B_float", 0.0) or 0.0)
         h = float(props.get("Ht_float", 0.0) or 0.0)
         if b > 0 and h > 0:
             return 2.0 * (b + h)
 
-        # Round HSS sometimes comes as OD
         od = float(props.get("OD_float", 0.0) or 0.0)
         if od > 0:
             return math.pi * od
@@ -209,13 +208,11 @@ def _structural_end_perimeter_one_end_in(props: Dict[str, Any]) -> float:
         if od > 0:
             return math.pi * od
 
-    # Wide flange / channel / angle / misc: use envelope if we have bf and d
     bf = float(props.get("bf_float", 0.0) or 0.0)
     d = float(props.get("d_float", 0.0) or 0.0)
     if bf > 0 and d > 0:
         return 2.0 * (bf + d)
 
-    # Fallback: no data
     return 0.0
 
 
@@ -223,8 +220,7 @@ def page_plate() -> None:
     st.header("Plate")
 
     # ------------------------------------------------------------
-    # 3D STEP Import (BBOX / Volume / Weight) — Streamlit Cloud friendly
-    # Requires dependencies: trimesh + cascadio (see notes in README/requirements)
+    # 3D STEP Import (BBOX / Volume / Weight)
     # ------------------------------------------------------------
     with st.expander("3D STEP Import (BBOX / Volume / Weight)", expanded=False):
         st.caption(
@@ -270,16 +266,12 @@ def page_plate() -> None:
         def _units_to_inches_factor(units_label: str) -> float:
             label = (units_label or "").lower()
             if "meter" in label:
-                return 39.37007874015748  # m -> in
+                return 39.37007874015748
             if "millimeter" in label or label == "mm":
-                return 1.0 / 25.4  # mm -> in
-            return 1.0  # inches
+                return 1.0 / 25.4
+            return 1.0
 
         def _mesh_preview_plotly(mesh, max_faces: int = 8000):
-            """
-            Build an interactive Plotly Mesh3d preview from a trimesh.Trimesh.
-            Uses optional simplification / face sampling to keep the app responsive.
-            """
             import plotly.graph_objects as go
 
             m = mesh
@@ -323,130 +315,11 @@ def page_plate() -> None:
             )
             return fig
 
-        def _load_step_metrics(step_bytes: bytes, units_label: str, scale: float):
-            """
-            Load STEP via trimesh+cascadio and return:
-              - overall metrics dict (bbox in, volume in^3)
-              - combined mesh in inches (for preview)
-              - parts list: [{name, bbox_w_in, bbox_l_in, bbox_h_in, volume_in3, mesh_in}]
-            Note: meshes are scaled to INCHES inside this function.
-
-            Thickness rule:
-              - smallest bbox dimension is treated as thickness
-              - the other two become width/length (width <= length)
-            """
-            import trimesh
-
-            scene_or_mesh = trimesh.load(file_obj=io.BytesIO(step_bytes), file_type="step")
-
-            unit_factor = _units_to_inches_factor(units_label)
-            factor = float(unit_factor) * float(scale)
-
-            def _mesh_to_inches(m: "trimesh.Trimesh") -> "trimesh.Trimesh":
-                m_in = m.copy()
-                # Ensure vertices are float array; trimesh uses numpy underneath
-                m_in.vertices = m.vertices * factor
-                return m_in
-
-            def _safe_volume_in3(m_in: "trimesh.Trimesh") -> float:
-                # trimesh volume requires watertight; fallback to convex hull volume if needed.
-                vol = float(m_in.volume)
-                if not (vol > 0):
-                    try:
-                        vol = float(m_in.convex_hull.volume)
-                    except Exception:
-                        vol = 0.0
-                return vol
-
-            parts = []
-
-            if isinstance(scene_or_mesh, trimesh.Scene):
-                # One row per geometry item in the scene (assembly-like STEP)
-                for name, geom in scene_or_mesh.geometry.items():
-                    if not isinstance(geom, trimesh.Trimesh):
-                        continue
-                    m_in = _mesh_to_inches(geom)
-                    ext = m_in.extents
-                    vol = _safe_volume_in3(m_in)
-
-                    dims = sorted([float(ext[0]), float(ext[1]), float(ext[2])])
-                    t_in, w_in, l_in = float(dims[0]), float(dims[1]), float(dims[2])
-
-                    parts.append(
-                        {
-                            "name": str(name),
-                            "bbox_w_in": float(w_in),
-                            "bbox_l_in": float(l_in),
-                            "bbox_h_in": float(t_in),
-                            "volume_in3": float(vol),
-                            "mesh_in": m_in,
-                        }
-                    )
-
-                if not parts:
-                    raise ValueError("No mesh geometry found in STEP scene.")
-
-                # Combined mesh for overall metrics + preview
-                mesh_combined = trimesh.util.concatenate([p["mesh_in"] for p in parts])
-
-            elif isinstance(scene_or_mesh, trimesh.Trimesh):
-                m_in = _mesh_to_inches(scene_or_mesh)
-                ext = m_in.extents
-                vol = _safe_volume_in3(m_in)
-
-                dims = sorted([float(ext[0]), float(ext[1]), float(ext[2])])
-                t_in, w_in, l_in = float(dims[0]), float(dims[1]), float(dims[2])
-
-                parts = [
-                    {
-                        "name": "Part",
-                        "bbox_w_in": float(w_in),
-                        "bbox_l_in": float(l_in),
-                        "bbox_h_in": float(t_in),
-                        "volume_in3": float(vol),
-                        "mesh_in": m_in,
-                    }
-                ]
-                mesh_combined = m_in
-            else:
-                raise ValueError("Unsupported geometry returned from STEP loader.")
-
-            ext = mesh_combined.extents
-            vol = _safe_volume_in3(mesh_combined)
-
-            dims = sorted([float(ext[0]), float(ext[1]), float(ext[2])])
-            t_in, w_in, l_in = float(dims[0]), float(dims[1]), float(dims[2])
-
-            overall_metrics = {
-                "bbox_w_in": float(w_in),
-                "bbox_l_in": float(l_in),
-                "bbox_h_in": float(t_in),
-                "volume_in3": float(vol),
-            }
-
-            return overall_metrics, mesh_combined, parts
-
         def _extract_step_parts_table(step_bytes: bytes, filename: str, units_label: str, scale: float, density_lb_in3: float):
-            """
-            Build a per-part table for a STEP upload.
-
-            - If STEP is an assembly/multi-body (trimesh.Scene), each geometry becomes a row.
-            - If STEP is a single part (trimesh.Trimesh), you get one row.
-
-            Thickness rule:
-              - smallest bbox dimension is treated as thickness
-              - the other two become width/length (width <= length)
-
-            Returns:
-              (df_parts, meshes_by_row_id)
-            """
             import trimesh
-            import pandas as pd
             import uuid
 
             scene_or_mesh = trimesh.load(file_obj=io.BytesIO(step_bytes), file_type="step")
-
-            # Convert imported units -> inches, then apply user scale.
             to_in = _units_to_inches_factor(units_label)
             factor = float(to_in) * float(scale)
 
@@ -459,7 +332,6 @@ def page_plate() -> None:
                 ]
                 dims_sorted = sorted(dims_in)
 
-                # Rule: smallest dimension is thickness; remaining two are width/length (width <= length)
                 t_in = float(dims_sorted[0])
                 w_in = float(dims_sorted[1])
                 l_in = float(dims_sorted[2])
@@ -467,7 +339,6 @@ def page_plate() -> None:
                 vol_raw = float(m.volume)
                 vol_in3 = vol_raw * (factor ** 3)
 
-                # If not watertight, fall back to convex hull volume.
                 if not (vol_in3 > 0):
                     try:
                         vol_raw2 = float(m.convex_hull.volume)
@@ -482,7 +353,6 @@ def page_plate() -> None:
             meshes_by_id = {}
 
             def _snap_thickness_to_list(t_in: float) -> float:
-                """Snap inferred thickness to nearest value in logic.THICKNESS_LIST (keeps editor/selectbox valid)."""
                 try:
                     opts = [float(x) for x in logic.THICKNESS_LIST]
                     if not opts:
@@ -542,21 +412,19 @@ def page_plate() -> None:
             return pd.DataFrame(rows), meshes_by_id
 
         if step_files:
-            import pandas as pd
-
             all_rows = []
             mesh_cache = {}
 
             for f in step_files:
                 try:
-                    df_parts, meshes_by_id = _extract_step_parts_table(
+                    df_parts_tmp, meshes_by_id = _extract_step_parts_table(
                         step_bytes=f.getvalue(),
                         filename=f.name,
                         units_label=geom_units,
                         scale=float(step_scale),
                         density_lb_in3=float(density),
                     )
-                    all_rows.extend(df_parts.to_dict("records"))
+                    all_rows.extend(df_parts_tmp.to_dict("records"))
                     mesh_cache.update(meshes_by_id)
                 except Exception as e:
                     st.error(
@@ -568,14 +436,25 @@ def page_plate() -> None:
             if not all_rows:
                 st.warning("No parts found in the uploaded STEP file(s).")
             else:
-                df_parts = pd.DataFrame(all_rows)
+                # ✅ Build a signature so we only rebuild the table when inputs change
+                sig = (
+                    tuple((f.name, len(f.getvalue())) for f in step_files),
+                    str(geom_units),
+                    float(step_scale),
+                    float(density),
+                )
 
-                # Force correct dtypes so Streamlit renders editable checkbox columns
-                try:
-                    df_parts["Include"] = df_parts["Include"].astype(bool)
-                    df_parts["Use STEP weight"] = df_parts["Use STEP weight"].astype(bool)
-                except Exception:
-                    pass
+                # ✅ Only rebuild if the upload/signature changed (or first load)
+                if (st.session_state.get("step_parts_signature") != sig) or (st.session_state.get("step_parts_df") is None):
+                    df_parts = pd.DataFrame(all_rows)
+
+                    # Force dtypes so Streamlit renders editable checkbox columns
+                    for col in ["Include", "Use STEP weight"]:
+                        if col in df_parts.columns:
+                            df_parts[col] = df_parts[col].astype(bool)
+
+                    st.session_state["step_parts_df"] = df_parts
+                    st.session_state["step_parts_signature"] = sig
 
                 st.markdown("#### STEP parts")
                 st.caption(
@@ -583,6 +462,9 @@ def page_plate() -> None:
                     "BBox/Volume/Weight are extracted from STEP. Smallest bbox dimension is treated as thickness; "
                     "the other two are width/length. Material/Thickness/Qty are editable."
                 )
+
+                # ✅ Always render from the persisted dataframe
+                df_parts = st.session_state["step_parts_df"]
 
                 edited = st.data_editor(
                     df_parts,
@@ -607,6 +489,9 @@ def page_plate() -> None:
                         "Row ID": st.column_config.TextColumn("Row ID", disabled=True),
                     },
                 )
+
+                # ✅ Persist edits so checkbox changes stick across reruns
+                st.session_state["step_parts_df"] = edited
 
                 with st.expander("Preview a selected part (optional)", expanded=False):
                     try:
@@ -643,7 +528,7 @@ def page_plate() -> None:
 
                             width = float(r.get("BBox W (in)", 0.0))
                             length = float(r.get("BBox L (in)", 0.0))
-                            perimeter = float(2.0 * (width + length))  # conservative bbox perimeter fallback
+                            perimeter = float(2.0 * (width + length))
 
                             burn_machine = logic.get_plate_burn_machine_type(thickness)
                             feedrate = logic.get_feedrate_for_thickness(thickness, logic.FEEDRATE_TABLE_IPM)
@@ -653,7 +538,6 @@ def page_plate() -> None:
                             burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
                             bend_time_item = 0.0
 
-                            # Default: plate formula weight
                             net_weight_item = logic.calculate_plate_net_weight(
                                 thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION
                             )
@@ -849,7 +733,6 @@ def page_plate() -> None:
                             drill_summary_str = ""
                             burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
 
-                            # No bends from DXF import (plate-only); user can edit later if desired.
                             bend_time_item = 0.0
 
                             net_weight_item = logic.calculate_plate_net_weight(
@@ -886,7 +769,6 @@ def page_plate() -> None:
                                 "Total Drilling Time (min)": round(drilling_time_item * quantity, 2),
                                 "Total Bend Time (min)": round(bend_time_item * quantity, 2),
                                 "Total Fit Time (min)": round(fit_time_item * quantity, 2),
-                                # DXF metrics (kept for transparency)
                                 "DXF Source": str(r.get("Source DXF", "")),
                                 "DXF Hole Count": int(r.get("Hole Count", 0)),
                                 "DXF Total Hole Circumference (in)": float(r.get("Total Hole Circumference (in)", 0.0)),
@@ -918,7 +800,6 @@ def page_plate() -> None:
             if num_bends == 0:
                 bend_complexity = "N/A"
 
-        # If STEP was loaded, show the metrics so the estimator can use them for sanity-checks
         if st.session_state.get("plate_step_loaded_name"):
             st.info(
                 f"STEP loaded: {st.session_state.get('plate_step_loaded_name')} | "
@@ -949,7 +830,6 @@ def page_plate() -> None:
         add = st.form_submit_button("Add plate to estimate")
 
     if add:
-        # Build a form-like dict for existing logic
         fake_form = {
             "hole_dia_1": hole_dia_1,
             "hole_qty_1": hole_qty_1,
@@ -966,11 +846,12 @@ def page_plate() -> None:
         burn_time_item = round(logic.calculate_burning_time(perimeter, feedrate), 2)
         bend_time_item = round(logic.calculate_bend_time(int(num_bends), bend_complexity, logic.BEND_TIME_PER_COMPLEXITY_MINUTES), 2)
         net_weight_item = logic.calculate_plate_net_weight(thickness, width, length, logic.DENSITY_FACTOR_FOR_CALCULATION)
-        # If STEP-derived weight is available, optionally override net weight for fit time + reporting
+
         if 'use_step_weight' in locals() and use_step_weight:
             step_wt = float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0)
             if step_wt > 0:
                 net_weight_item = step_wt
+
         gross_weight_item = logic.calculate_gross_weight(net_weight_item, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
         fit_time_item = logic.calculate_fit_time(net_weight_item)
 
@@ -1015,21 +896,10 @@ def page_structural() -> None:
 
     structural_types = sorted(list(logic.AISC_TYPES_TO_LABELS_MAP.keys()))
 
-    # NOTE: We intentionally do NOT wrap these widgets in a st.form.
-    # Streamlit forms do not rerun the script on widget changes, which breaks
-    # dependent dropdowns (Type -> Shape). Keeping them outside the form ensures
-    # the Shape list updates immediately when Type changes.
-
-    # Streamlit can sometimes keep the previous selectbox value even when
-    # the options list changes (especially with very large lists).
-    # To make the dependent dropdown rock-solid, we give the Shape widget a
-    # *type-specific key* so it remounts whenever Type changes.
-
     def _cleanup_old_shape_keys(current_type: str) -> None:
         prefix = "struct_shape_"
         for k in list(st.session_state.keys()):
             if k.startswith(prefix) and k != f"{prefix}{current_type}":
-                # keep state tidy; not strictly required
                 del st.session_state[k]
 
     c1, c2 = st.columns(2)
@@ -1046,7 +916,6 @@ def page_structural() -> None:
         _cleanup_old_shape_keys(structural_type)
 
         shape_key = f"struct_shape_{structural_type}"
-        # Ensure there is a valid default for this Type.
         if labels and shape_key not in st.session_state:
             st.session_state[shape_key] = labels[0]
         shape_label = st.selectbox("Shape", options=labels, key=shape_key)
@@ -1090,7 +959,6 @@ def page_structural() -> None:
             "Total Gross Weight (lbs)": round(gross_wt * quantity, 2),
             "Total Cutting Time (min)": round(cut_t * quantity, 2),
             "Total Fit Time (min)": round(fit_t * quantity, 2),
-            # Keep these so totals logic is simpler
             "Burn Machine Type": "N/A",
             "Burning Time (min/item)": 0.0,
             "Total Burning Time (min)": 0.0,
@@ -1115,7 +983,6 @@ def page_welding() -> None:
         cjp_count = 0
 
         for i in range(1, 11):
-            # (Most users only need a handful; increase to 50 if you want, but 10 is cleaner UI.)
             cols = st.columns([2, 2, 1, 1])
             with cols[0]:
                 size = st.selectbox(f"Weld size #{i}", options=[""] + logic.WELD_SIZE_OPTIONS, key=f"wsize_{i}")
@@ -1149,7 +1016,6 @@ def page_welding() -> None:
             "Weld Details Summary": weld_details_summary,
             "Total Weld Wire (lbs)": total_wire_weight,
             "Total Weld Time (hours)": total_time_hours,
-            # Keep totals keys consistent
             "Total Gross Weight (lbs)": 0.0,
             "Total Burning Time (min)": 0.0,
             "Total Drilling Time (min)": 0.0,
@@ -1165,7 +1031,6 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     plate_wt = 0.0
     struct_wt = 0.0
     plt_bend_t = 0.0
-    # Structural cutting time is treated as "saw" time in the UI totals.
     str_cut_t = 0.0
     fit_t = 0.0
     laser_burn_t = 0.0
@@ -1182,7 +1047,6 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     for r in rows:
         fit_t += float(r.get("Total Fit Time (min)", 0.0) or 0.0)
 
-        # Plate perimeter is stored as inches per item; multiply by quantity where available.
         try:
             per_item = float(r.get("Perimeter (in/item)", 0.0) or 0.0)
             qty = int(r.get("Quantity", 0) or 0)
@@ -1214,9 +1078,7 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "grand_total_kinetic_burn_time": kinetic_burn_t,
         "grand_total_plate_drilling_time": drill_t,
         "grand_total_plate_bend_time": plt_bend_t,
-        # Back-compat key (older UI label)
         "grand_total_structural_cutting_time": str_cut_t,
-        # Preferred key (explicit)
         "grand_total_saw_time": str_cut_t,
         "grand_total_fit_time": fit_t,
         "grand_total_weld_time_hours": weld_time_hr,
@@ -1239,7 +1101,6 @@ def page_summary() -> None:
 
     totals = _compute_totals(rows)
 
-    # Primary headline totals
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total gross weight (lbs)", f"{totals['combined_overall_gross_weight']:.2f}")
     c2.metric("Total fit time (min)", f"{totals['grand_total_fit_time']:.2f}")
@@ -1252,7 +1113,6 @@ def page_summary() -> None:
     p3.metric("Total plate weight (lbs)", f"{totals['plate_total_gross_weight']:.2f}")
     p4.metric("Total structural weight (lbs)", f"{totals['structural_total_gross_weight']:.2f}")
 
-    # Time breakdown (requested): Saw / Laser / Kinetic
     t1, t2, t3 = st.columns(3)
     t1.metric("Saw time (min)", f"{totals.get('grand_total_saw_time', totals.get('grand_total_structural_cutting_time', 0.0)):.2f}")
     t2.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
@@ -1283,174 +1143,12 @@ def page_summary() -> None:
         mime="text/csv",
     )
 
-    st.divider()
-
-    # ---- Plate yield ----
-    if totals["has_plate_entries"]:
-        st.subheader("Plate yield")
-        # Group plates by thickness + material
-        grouped = {}
-        for r in rows:
-            if r.get("Estimation Type") != "Plate":
-                continue
-            key = f"{float(r.get('Thickness (in)', 0.0)):.4f}in_{r.get('Material', 'N/A')}"
-            grouped.setdefault(key, {"material": r.get("Material"), "thickness": r.get("Thickness (in)"), "parts_list": []})
-            grouped[key]["parts_list"].append(
-                {
-                    "width": float(r.get("Width (in)", 0.0) or 0.0),
-                    "height": float(r.get("Length (in)", 0.0) or 0.0),
-                    "quantity": int(r.get("Quantity", 0) or 0),
-                }
-            )
-
-        with st.form("plate_yield"):
-            stock_inputs = {}
-            for key, g in grouped.items():
-                st.markdown(f"**{g['material']} @ {float(g['thickness']):.4f} in**")
-                c1, c2 = st.columns(2)
-                with c1:
-                    sw = st.number_input(f"Stock width (in) — {key}", min_value=0.0, value=60.0, step=1.0)
-                with c2:
-                    sl = st.number_input(f"Stock length (in) — {key}", min_value=0.0, value=120.0, step=1.0)
-                stock_inputs[key] = (float(sw), float(sl))
-                st.write("—")
-            run = st.form_submit_button("Calculate plate yield")
-
-        if run:
-            results = {}
-            for key, g in grouped.items():
-                stock_w, stock_h = stock_inputs[key]
-                sheets_needed, layouts = logic.calculate_plate_nesting_yield(g["parts_list"], stock_w, stock_h)
-                total_parts_area = sum(p["width"] * p["height"] * p["quantity"] for p in g["parts_list"])
-                total_stock_area = sheets_needed * stock_w * stock_h
-                yield_pct = (total_parts_area / total_stock_area) * 100 if total_stock_area > 0 else 0.0
-                results[key] = {
-                    "stock_size": f"{stock_w:.2f}x{stock_h:.2f} in",
-                    "sheets_needed": sheets_needed,
-                    "yield_percent": yield_pct,
-                    "layouts": layouts,
-                    "unplaced_count": len(layouts[-1].get("unplaced_parts", [])) if layouts else 0,
-                }
-            st.session_state["plate_yield_results"] = results
-
-        # Display saved results
-        if st.session_state["plate_yield_results"]:
-            for key, res in st.session_state["plate_yield_results"].items():
-                st.markdown(f"**{key}**")
-                st.write(
-                    {
-                        "Stock": res["stock_size"],
-                        "Sheets needed": res["sheets_needed"],
-                        "Yield %": round(res["yield_percent"], 2),
-                        "Unplaced": res["unplaced_count"],
-                    }
-                )
-                for i, layout in enumerate(res.get("layouts", []), start=1):
-                    st.image(_create_yield_image(layout), caption=f"Sheet {i}")
-
-    # ---- Structural yield ----
-    if totals["has_structural_entries"]:
-        st.subheader("Structural yield")
-        # Group by shape label
-        grouped_struct = {}
-        for r in rows:
-            if r.get("Estimation Type") != "Structural":
-                continue
-            label = r.get("Shape Label")
-            if not label:
-                continue
-            grouped_struct.setdefault(label, []).append({"length": float(r.get("Length (in)", 0.0)), "quantity": int(r.get("Quantity", 0))})
-
-        with st.form("struct_yield"):
-            stock_len_inputs = {}
-            for label in grouped_struct:
-                stock_len_inputs[label] = st.text_input(
-                    f"Stock lengths for {label} (comma-separated, inches)",
-                    value="240, 480",
-                )
-            run_s = st.form_submit_button("Calculate structural yield")
-
-        if run_s:
-            yield_results_by_shape = {}
-            for label, parts_list in grouped_struct.items():
-                stock_str = stock_len_inputs.get(label, "")
-                try:
-                    stock_lengths = sorted(
-                        [float(s.strip()) for s in stock_str.split(",") if s.strip() and float(s.strip()) > 0],
-                        reverse=True,
-                    )
-                except Exception:
-                    yield_results_by_shape[label] = {"error": "Invalid stock lengths."}
-                    continue
-
-                all_cuts = []
-                total_req = 0.0
-                for pe in parts_list:
-                    all_cuts.extend([float(pe["length"])] * int(pe["quantity"]))
-                    total_req += float(pe["length"]) * int(pe["quantity"])
-                if not all_cuts:
-                    yield_results_by_shape[label] = {"info": "No cuts required."}
-                    continue
-
-                options = []
-                best = {"stock_length": None, "bars_used": float("inf"), "total_waste": float("inf"), "yield_percentage": 0.0}
-                for stock_len in stock_lengths:
-                    cuts_fit = [c for c in all_cuts if c <= stock_len]
-                    if not cuts_fit:
-                        options.append({"stock_length": stock_len, "bars_used": 0, "total_waste": 0.0, "yield_percentage": 0.0, "info": "No cuts fit."})
-                        continue
-                    bars, waste = logic.calculate_yield_for_stock_size(list(cuts_fit), stock_len)
-                    actual_cut = sum(cuts_fit)
-                    total_stock = bars * stock_len
-                    yield_pct = (actual_cut / total_stock) * 100 if total_stock > 0 else 0.0
-                    can_make_all = len(cuts_fit) == len(all_cuts)
-                    current = {
-                        "stock_length": stock_len,
-                        "bars_used": bars,
-                        "total_waste": round(waste, 2),
-                        "yield_percentage": round(yield_pct, 2),
-                        "can_make_all_parts": can_make_all,
-                    }
-                    options.append(current)
-                    if can_make_all:
-                        if (current["bars_used"] < best["bars_used"]) or (
-                            current["bars_used"] == best["bars_used"] and current["total_waste"] < best["total_waste"]
-                        ):
-                            best = current.copy()
-                for o in options:
-                    o["is_best"] = best["stock_length"] is not None and o.get("stock_length") == best.get("stock_length")
-                yield_results_by_shape[label] = {
-                    "options": options,
-                    "best_overall": best if best["stock_length"] is not None else None,
-                    "total_required_length": round(total_req, 2),
-                }
-            st.session_state["structural_yield_results"] = yield_results_by_shape
-
-        if st.session_state["structural_yield_results"]:
-            for label, res in st.session_state["structural_yield_results"].items():
-                st.markdown(f"**{label}**")
-                if "error" in res:
-                    st.error(res["error"])
-                    continue
-                if "info" in res:
-                    st.info(res["info"])
-                    continue
-                st.write({"Total required length (in)": res.get("total_required_length")})
-                for o in res.get("options", []):
-                    tag = "✅ best" if o.get("is_best") else ""
-                    st.write(
-                        f"{tag} Stock {o['stock_length']:.2f} in → bars: {o['bars_used']}, "
-                        f"waste: {o.get('total_waste',0):.2f} in, yield: {o.get('yield_percentage',0):.2f}% "
-                        f"({'ALL parts' if o.get('can_make_all_parts') else 'partial'})"
-                    )
-
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     _init_state()
     require_auth()
 
-    # Load AISC DB
     ok = _load_aisc_once(logic.AISC_CSV_FILENAME)
     if not ok:
         st.warning("AISC database could not be loaded. Structural tab will not work until the CSV is present.")
