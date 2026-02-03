@@ -871,14 +871,73 @@ def page_plate() -> None:
 
     # ------------------------------------------------------------
     # Manual Plate entry (supports drilling + rolling)
-    # NOTE: Rolling controls MUST be outside st.form for dynamic reveal
+    # Rolling controls must be OUTSIDE st.form for dynamic reveal,
+    # so we use a normal button instead of st.form_submit_button.
     # ------------------------------------------------------------
 
-    # Rolling controls OUTSIDE the form so they reveal immediately
+    # Plate base inputs
+    c1, c2 = st.columns(2)
+    with c1:
+        part_name = st.text_input(
+            "Part name",
+            value=st.session_state.get("plate_part_name", "Unnamed Plate"),
+            key="plate_part_name",
+        )
+        quantity = st.number_input(
+            "Quantity",
+            min_value=1,
+            value=int(st.session_state.get("plate_qty", 1)),
+            step=1,
+            key="plate_qty",
+        )
+        material = st.selectbox("Material", options=logic.MATERIALS_LIST, index=0, key="plate_mat")
+        thickness = st.selectbox("Thickness (in)", options=logic.THICKNESS_LIST, index=0, key="plate_thk")
+    with c2:
+        width = st.number_input(
+            "Width (in)",
+            min_value=0.0,
+            value=float(st.session_state.get("plate_w", 0.0)),
+            step=0.25,
+            key="plate_w",
+        )
+        length = st.number_input(
+            "Length (in)",
+            min_value=0.0,
+            value=float(st.session_state.get("plate_l", 0.0)),
+            step=0.25,
+            key="plate_l",
+        )
+        num_bends = st.number_input("Bends (per item)", min_value=0, value=0, step=1)
+        bend_complexity = st.selectbox("Bend complexity", options=["N/A"] + logic.BEND_COMPLEXITY_OPTIONS, index=0)
+        if num_bends == 0:
+            bend_complexity = "N/A"
+
+    if st.session_state.get("plate_step_loaded_name"):
+        st.info(
+            f"STEP loaded: {st.session_state.get('plate_step_loaded_name')} | "
+            f"Volume: {st.session_state.get('plate_step_volume_in3', 0.0):.3f} in³ | "
+            f"Weight: {st.session_state.get('plate_step_weight_lbs', 0.0):.2f} lb | "
+            f"BBox H: {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
+        )
+
+    # Drilling (optional)
+    st.markdown("#### Drilling (optional)")
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        hole_dia_1 = st.number_input("Hole 1 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+        hole_qty_1 = st.number_input("Hole 1 qty", min_value=0, value=0, step=1)
+    with d2:
+        hole_dia_2 = st.number_input("Hole 2 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+        hole_qty_2 = st.number_input("Hole 2 qty", min_value=0, value=0, step=1)
+    with d3:
+        hole_dia_3 = st.number_input("Hole 3 dia (in)", min_value=0.0, value=0.0, step=0.0625)
+        hole_qty_3 = st.number_input("Hole 3 qty", min_value=0, value=0, step=1)
+
+    # Rolling (optional) — NOW positionally right after drilling, still outside form
     st.markdown("#### Rolling (optional)")
     rolling_required = st.checkbox("Rolling required", value=False, key="plate_roll_required")
 
-    # Defaults (in case not required)
+    # Defaults
     rolling_type = st.session_state.get("plate_roll_type", "Cylinder")
     rolling_od_bucket = st.session_state.get("plate_roll_od", "Large OD (60\"+)")
     rolling_prebend = st.session_state.get("plate_roll_prebend", False)
@@ -900,77 +959,20 @@ def page_plate() -> None:
         with r4:
             rolling_tight_tol = st.checkbox("Tight tolerance", value=False, key="plate_roll_tighttol")
 
+    # STEP Weight (optional)
+    st.markdown("#### STEP Weight (optional)")
+    use_step_weight = st.checkbox(
+        "Use STEP-derived weight for fit time (and reporting)",
+        value=bool(st.session_state.get("plate_step_weight_lbs", 0.0) > 0),
+        help="If enabled and a STEP file was loaded, the app uses STEP weight instead of plate formula weight.",
+        key="plate_use_step_weight_manual",
+    )
+
     st.divider()
 
-    # Form for plate + drilling + STEP weight toggle
-    with st.form("plate_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            part_name = st.text_input(
-                "Part name",
-                value=st.session_state.get("plate_part_name", "Unnamed Plate"),
-                key="plate_part_name",
-            )
-            quantity = st.number_input(
-                "Quantity",
-                min_value=1,
-                value=int(st.session_state.get("plate_qty", 1)),
-                step=1,
-                key="plate_qty",
-            )
-            material = st.selectbox("Material", options=logic.MATERIALS_LIST, index=0, key="plate_mat")
-            thickness = st.selectbox("Thickness (in)", options=logic.THICKNESS_LIST, index=0, key="plate_thk")
-        with c2:
-            width = st.number_input(
-                "Width (in)",
-                min_value=0.0,
-                value=float(st.session_state.get("plate_w", 0.0)),
-                step=0.25,
-                key="plate_w",
-            )
-            length = st.number_input(
-                "Length (in)",
-                min_value=0.0,
-                value=float(st.session_state.get("plate_l", 0.0)),
-                step=0.25,
-                key="plate_l",
-            )
-            num_bends = st.number_input("Bends (per item)", min_value=0, value=0, step=1)
-            bend_complexity = st.selectbox("Bend complexity", options=["N/A"] + logic.BEND_COMPLEXITY_OPTIONS, index=0)
-            if num_bends == 0:
-                bend_complexity = "N/A"
+    # Add button (not a form submit) so rolling reveals instantly
+    add = st.button("Add plate to estimate", type="primary", key="plate_add_btn")
 
-        if st.session_state.get("plate_step_loaded_name"):
-            st.info(
-                f"STEP loaded: {st.session_state.get('plate_step_loaded_name')} | "
-                f"Volume: {st.session_state.get('plate_step_volume_in3', 0.0):.3f} in³ | "
-                f"Weight: {st.session_state.get('plate_step_weight_lbs', 0.0):.2f} lb | "
-                f"BBox H: {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
-            )
-
-        st.markdown("#### Drilling (optional)")
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            hole_dia_1 = st.number_input("Hole 1 dia (in)", min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_1 = st.number_input("Hole 1 qty", min_value=0, value=0, step=1)
-        with d2:
-            hole_dia_2 = st.number_input("Hole 2 dia (in)", min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_2 = st.number_input("Hole 2 qty", min_value=0, value=0, step=1)
-        with d3:
-            hole_dia_3 = st.number_input("Hole 3 dia (in)", min_value=0.0, value=0.0, step=0.0625)
-            hole_qty_3 = st.number_input("Hole 3 qty", min_value=0, value=0, step=1)
-
-        st.markdown("#### STEP Weight (optional)")
-        use_step_weight = st.checkbox(
-            "Use STEP-derived weight for fit time (and reporting)",
-            value=bool(st.session_state.get("plate_step_weight_lbs", 0.0) > 0),
-            help="If enabled and a STEP file was loaded, the app uses STEP weight instead of plate formula weight.",
-            key="plate_use_step_weight_manual",
-        )
-
-        add = st.form_submit_button("Add plate to estimate")
-
-    # Handle add AFTER the form submits (but uses rolling values from outside form)
     if add:
         fake_form = {
             "hole_dia_1": hole_dia_1,
@@ -992,12 +994,10 @@ def page_plate() -> None:
             2,
         )
 
-        # Base plate weight (formula)
         net_weight_item = logic.calculate_plate_net_weight(
             thickness, width, length, getattr(logic, "DENSITY_FACTOR_FOR_CALCULATION", 0.283)
         )
 
-        # Optional override from STEP
         if use_step_weight:
             step_wt = float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0)
             if step_wt > 0:
