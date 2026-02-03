@@ -1464,10 +1464,12 @@ def page_summary() -> None:
     p2.metric("Structural end perimeter (in)", f"{totals['grand_total_structural_end_perimeter_in']:.2f}")
     p3.metric("Combined perimeter (in)", f"{totals['grand_total_combined_perimeter_in']:.2f}")
 
-    t1, t2, t3 = st.columns(3)
+    # Cutting / processing time rollups
+    t1, t2, t3, t4 = st.columns(4)
     t1.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
     t2.metric("Kinetic time (min)", f"{totals['grand_total_kinetic_burn_time']:.2f}")
     t3.metric("Plate drilling (min)", f"{totals['grand_total_plate_drilling_time']:.2f}")
+    t4.metric("Saw time (min)", f"{totals['grand_total_structural_cutting_time']:.2f}")
 
     with st.expander("Estimate line items", expanded=False):
         st.dataframe(rows, use_container_width=True)
