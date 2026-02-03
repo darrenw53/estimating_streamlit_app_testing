@@ -271,56 +271,297 @@ def _structural_end_perimeter_one_end_in(props: Dict[str, Any]) -> float:
     return 0.0
 
 
+
+# ============================================================
+# Cone development helpers + shared rolling heuristic
+# ============================================================
+
+def _rolling_time_minutes_per_item(
+    weight_lbs: float,
+    rolling_type: str,
+    od_bucket: str,
+    prebend: bool,
+    tight_tolerance: bool,
+) -> float:
+    """Heuristic rolling runtime (minutes/item) based on part weight + options.
+
+    NOTE: This is intentionally simple. Adjust buckets/multipliers to match Weldall actuals.
+    """
+    w = max(0.0, float(weight_lbs or 0.0))
+
+    # Base time by weight bucket (minutes)
+    if w <= 250:
+        base = 15
+    elif w <= 500:
+        base = 30
+    elif w <= 1000:
+        base = 45
+    elif w <= 2000:
+        base = 75
+    elif w <= 4000:
+        base = 120
+    else:
+        base = 180
+
+    rtype = (rolling_type or "Cylinder").strip().lower()
+    if rtype.startswith("cone"):
+        base *= 1.25
+
+    bucket = (od_bucket or "").lower()
+    if "small" in bucket or "<" in bucket:
+        base *= 1.20
+    elif "medium" in bucket:
+        base *= 1.10
+    # large bucket: no multiplier
+
+    if prebend:
+        base += 15  # +0.25 hr
+    if tight_tolerance:
+        base += 30  # +0.50 hr
+
+    return float(round(base, 2))
+
+
+def _cone_development_truncated(D1: float, D2: float, H: float, use_mean_diam: bool, thickness: float) -> Dict[str, float]:
+    """Truncated cone development as an annular sector.
+
+    D1 = large diameter, D2 = small diameter, H = vertical height (all same units; we use inches in the UI)
+    If use_mean_diam is True, we approximate by using mean radii (OD/2 - t/2).
+    Returns: Rin, Rout, theta_rad, theta_deg, arc_in, arc_out, slant_small, slant_large
+    """
+    if D1 <= 0 or D2 < 0 or H <= 0:
+        raise ValueError("D1 must be > 0, D2 must be >= 0, H must be > 0.")
+    r_large = D1 / 2.0
+    r_small = D2 / 2.0
+    if use_mean_diam:
+        r_large = max(0.0, r_large - thickness / 2.0)
+        r_small = max(0.0, r_small - thickness / 2.0)
+
+    if r_large <= r_small:
+        raise ValueError("Large diameter must be greater than small diameter.")
+
+    # Full cone height from apex to large end (similar triangles)
+    H_full = H * (r_large / (r_large - r_small))
+
+    # Slant lengths from apex to each end
+    slant_large = math.sqrt(H_full**2 + r_large**2)
+    slant_small = math.sqrt((H_full - H)**2 + r_small**2)
+
+    # Included angle: theta * slant_large = circumference at large end
+    theta_rad = (2.0 * math.pi * r_large) / slant_large
+    theta_deg = math.degrees(theta_rad)
+
+    arc_out = theta_rad * slant_large
+    arc_in = theta_rad * slant_small
+
+    return {
+        "r_large": r_large,
+        "r_small": r_small,
+        "H_full": H_full,
+        "Rout": slant_large,
+        "Rin": slant_small,
+        "theta_rad": theta_rad,
+        "theta_deg": theta_deg,
+        "arc_out": arc_out,
+        "arc_in": arc_in,
+        "slant_large": slant_large,
+        "slant_small": slant_small,
+    }
+
+
+def _cone_sector_area(Rout: float, Rin: float, theta_rad: float) -> float:
+    """Area of an annular sector."""
+    return 0.5 * float(theta_rad) * (float(Rout) ** 2 - float(Rin) ** 2)
+
+
+def page_cone_calculator() -> None:
+    st.header("Cone Calculator")
+    st.caption(
+        "Build a truncated cone flat pattern (annular sector). "
+        "You can add the developed gore(s) into the estimate as Plate line items."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        D1 = st.number_input('Large Diameter D1 (in)', min_value=0.0, value=60.0, step=0.25, key="cone_D1")
+        D2 = st.number_input('Small Diameter D2 (in)', min_value=0.0, value=30.0, step=0.25, key="cone_D2")
+        H = st.number_input('Height H (in)', min_value=0.0, value=24.0, step=0.25, key="cone_H")
+        gores = st.number_input('Number of gores (pieces)', min_value=1, value=1, step=1, key="cone_gores")
+    with c2:
+        material = st.selectbox("Material", options=logic.MATERIALS_LIST, index=0, key="cone_mat")
+        thickness = st.selectbox("Thickness (in)", options=logic.THICKNESS_LIST, index=0, key="cone_thk")
+        quantity = st.number_input("Quantity (per gore)", min_value=1, value=1, step=1, key="cone_qty")
+        use_mean = st.checkbox("Use mean diameter (OD - t)", value=True, key="cone_use_mean")
+    with c3:
+        seam_allow = st.number_input(
+            "Seam allowance per radial edge (in)",
+            min_value=0.0,
+            value=0.5,
+            step=0.125,
+            help="Adds extra length to each radial edge for fit-up/trim.",
+            key="cone_seam_allow",
+        )
+        add_roll = st.checkbox("Rolling required (estimate rolling time)", value=True, key="cone_roll_required")
+        rolling_od_bucket = st.selectbox(
+            "OD bucket",
+            ["Small OD (<24\")", "Medium OD (24–60\")", "Large OD (60\"+)"],
+            index=2,
+            key="cone_roll_od",
+        )
+        rolling_prebend = st.checkbox("Prebend", value=False, key="cone_roll_prebend")
+        rolling_tight_tol = st.checkbox("Tight tolerance", value=False, key="cone_roll_tighttol")
+
+    # Compute development
+    try:
+        dev = _cone_development_truncated(
+            D1=float(D1),
+            D2=float(D2),
+            H=float(H),
+            use_mean_diam=bool(use_mean),
+            thickness=float(thickness),
+        )
+    except Exception as e:
+        st.error(f"Cannot compute cone development: {e}")
+        return
+
+    Rout = float(dev["Rout"])
+    Rin = float(dev["Rin"])
+    theta_rad = float(dev["theta_rad"])
+    theta_deg = float(dev["theta_deg"])
+
+    # Per-gore
+    n_gores = int(gores)
+    theta_g = theta_rad / n_gores
+    theta_g_deg = math.degrees(theta_g)
+
+    arc_out_g = dev["arc_out"] / n_gores
+    arc_in_g = dev["arc_in"] / n_gores
+
+    # Cut perimeter of one gore sector (two arcs + two radial edges)
+    radial_edge = (Rout - Rin) + float(seam_allow)
+    cut_perim_g = float(arc_out_g) + float(arc_in_g) + 2.0 * float(radial_edge)
+
+    # Area + weight for one gore
+    area_total = _cone_sector_area(Rout, Rin, theta_rad)
+    area_g = area_total / n_gores
+
+    density = float(getattr(logic, "DENSITY_FACTOR_FOR_CALCULATION", 0.283))
+    net_weight_g = float(area_g) * float(thickness) * float(density)
+
+    gross_weight_g = logic.calculate_gross_weight(net_weight_g, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
+    fit_time_g = logic.calculate_fit_time(net_weight_g)
+
+    # Burning
+    burn_machine = logic.get_plate_burn_machine_type(thickness)
+    feedrate = logic.get_feedrate_for_thickness(thickness, logic.FEEDRATE_TABLE_IPM)
+    burn_time_g = round(logic.calculate_burning_time(cut_perim_g, feedrate), 2)
+
+    # Rolling (optional)
+    rolling_time_item = 0.0
+    total_rolling_time = 0.0
+    if add_roll:
+        rolling_time_item = _rolling_time_minutes_per_item(
+            weight_lbs=net_weight_g,
+            rolling_type="Cone",
+            od_bucket=rolling_od_bucket,
+            prebend=rolling_prebend,
+            tight_tolerance=rolling_tight_tol,
+        )
+        total_rolling_time = round(float(rolling_time_item) * int(quantity), 2)
+
+    st.subheader("Development results")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Outer radius (Rout)", f"{Rout:.3f}")
+    m2.metric("Inner radius (Rin)", f"{Rin:.3f}")
+    m3.metric("Included angle (θ)", f"{theta_deg:.3f}°")
+    m4.metric("Angle per gore", f"{theta_g_deg:.3f}°")
+
+    st.write("**Per gore:**")
+    st.write(f"- Outer arc: **{arc_out_g:.3f} in**")
+    st.write(f"- Inner arc: **{arc_in_g:.3f} in**")
+    st.write(f"- Radial edge (incl seam allowance): **{radial_edge:.3f} in**")
+    st.write(f"- Cut perimeter: **{cut_perim_g:.3f} in**")
+    st.write(f"- Developed area: **{area_g:.3f} in²**")
+    st.write(f"- Net weight (est.): **{net_weight_g:.2f} lb**")
+
+    st.divider()
+
+    st.subheader("Add to estimate as Plate")
+    part_name = st.text_input(
+        "Part name (gore)",
+        value=f"Cone gore (D1={float(D1):.1f}, D2={float(D2):.1f}, H={float(H):.1f})",
+        key="cone_part_name",
+    )
+
+    add_btn = st.button("Add cone gore(s) to estimate", type="primary", key="cone_add_btn")
+    if add_btn:
+        # Create a Plate-type estimate line item representing one gore.
+        # Quantity field is per-gore qty. Total pieces added = quantity (per gore).
+        notes = (
+            f"Cone dev | D1={float(D1):.3f}, D2={float(D2):.3f}, H={float(H):.3f}, "
+            f"Rout={Rout:.3f}, Rin={Rin:.3f}, θ_total={theta_deg:.3f}°, gores={n_gores}, "
+            f"θ_gore={theta_g_deg:.3f}°, seam_allow={float(seam_allow):.3f}"
+        )
+
+        part = {
+            "Estimation Type": "Plate",
+            "Part Name": str(part_name),
+            "Quantity": int(quantity),
+            "Material": material,
+            "Thickness (in)": float(thickness),
+
+            # For the plate table we keep Width/Length fields populated for visibility.
+            # These are NOT the true developed bounding box; they are representative.
+            "Width (in)": round(float(arc_out_g), 3),
+            "Length (in)": round(float(radial_edge), 3),
+
+            "Bends (per item)": 0,
+            "Bend Complexity": "N/A",
+            "Burn Machine Type": burn_machine,
+            "Perimeter (in/item)": round(float(cut_perim_g), 2),
+            "Feedrate (IPM)": float(feedrate),
+            "Drilling Time (min/item)": 0.0,
+            "Drill Details Summary": "",
+            "Burning Time (min/item)": float(burn_time_g),
+            "Bend Time (min/item)": 0.0,
+
+            "Rolling Required": "Yes" if add_roll else "No",
+            "Rolling Type": "Cone" if add_roll else "",
+            "Rolling OD Bucket": rolling_od_bucket if add_roll else "",
+            "Rolling Prebend": "Yes" if (add_roll and rolling_prebend) else "No" if add_roll else "",
+            "Rolling Tight Tolerance": "Yes" if (add_roll and rolling_tight_tol) else "No" if add_roll else "",
+            "Rolling Time (min/item)": float(rolling_time_item),
+
+            "Net Weight (lbs/item)": round(float(net_weight_g), 2),
+            "Gross Weight (lbs/item)": round(float(gross_weight_g), 2),
+            "Fit Time (min/item)": float(fit_time_g),
+
+            "Total Gross Weight (lbs)": round(float(gross_weight_g) * int(quantity), 2),
+            "Total Burning Time (min)": round(float(burn_time_g) * int(quantity), 2),
+            "Total Drilling Time (min)": 0.0,
+            "Total Bend Time (min)": 0.0,
+            "Total Rolling Run Time (min)": float(total_rolling_time),
+            "Total Fit Time (min)": round(float(fit_time_g) * int(quantity), 2),
+
+            # Helpful extra fields (won't break anything; exports with extra columns)
+            "Cone D1 (in)": float(D1),
+            "Cone D2 (in)": float(D2),
+            "Cone H (in)": float(H),
+            "Cone Rout (in)": float(Rout),
+            "Cone Rin (in)": float(Rin),
+            "Cone Theta Total (deg)": float(theta_deg),
+            "Cone Theta Gore (deg)": float(theta_g_deg),
+            "Cone Seam Allow (in)": float(seam_allow),
+            "Cone Notes": notes,
+        }
+
+        _add_part(part)
+        st.success("Cone gore(s) added as Plate line item(s).")
+        st.rerun()
+
+
 def page_plate() -> None:
     st.header("Plate")
-
-    # ------------------------------------------------------------
-    # Rolling heuristic (minutes per item) based on weight + options
-    # ------------------------------------------------------------
-    def _rolling_time_minutes_per_item(
-        weight_lbs: float,
-        rolling_type: str,
-        od_bucket: str,
-        prebend: bool,
-        tight_tolerance: bool,
-    ) -> float:
-        """
-        Heuristic rolling runtime (minutes/item) based on part weight + options.
-        Adjust these buckets to match your shop’s actuals.
-        """
-        w = max(0.0, float(weight_lbs or 0.0))
-
-        # Base time by weight bucket (minutes)
-        if w <= 250:
-            base = 15
-        elif w <= 500:
-            base = 30
-        elif w <= 1000:
-            base = 45
-        elif w <= 2000:
-            base = 75
-        elif w <= 4000:
-            base = 120
-        else:
-            base = 180
-
-        rtype = (rolling_type or "Cylinder").strip().lower()
-        if rtype.startswith("cone"):
-            base *= 1.25
-
-        bucket = (od_bucket or "").lower()
-        if "small" in bucket or "<" in bucket:
-            base *= 1.20
-        elif "medium" in bucket:
-            base *= 1.10
-        # large bucket: no multiplier
-
-        if prebend:
-            base += 15  # +0.25 hr
-        if tight_tolerance:
-            base += 30  # +0.50 hr
-
-        return float(round(base, 2))
 
     # ------------------------------------------------------------
     # 3D STEP Import (BBOX / Volume / Weight)
@@ -1537,7 +1778,7 @@ def main() -> None:
 
     with st.sidebar:
         st.title(APP_TITLE)
-        page = st.radio("Go to", ["Plate", "Structural", "Welding", "Summary"], index=0, key="nav_page")
+        page = st.radio("Go to", ["Plate", "Cone Calculator", "Structural", "Welding", "Summary"], index=0, key="nav_page")
         st.write("—")
         st.write(f"Items in estimate: **{len(st.session_state['estimate_parts'])}**")
         if st.button("Clear estimate", type="secondary", key="clear_estimate_btn"):
@@ -1549,6 +1790,8 @@ def main() -> None:
 
     if page == "Plate":
         page_plate()
+    elif page == "Cone Calculator":
+        page_cone_calculator()
     elif page == "Structural":
         page_structural()
     elif page == "Welding":
