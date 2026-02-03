@@ -2,6 +2,7 @@ import io
 import os
 import hmac
 import datetime
+import math
 from typing import Dict, Any, List
 
 import streamlit as st
@@ -38,7 +39,6 @@ def _init_state() -> None:
     st.session_state.setdefault("plate_step_weight_lbs", 0.0)
     st.session_state.setdefault("plate_step_bbox_h_in", 0.0)
     st.session_state.setdefault("plate_step_loaded_name", "")
-
 
 
 def _get_password_from_secrets_or_env() -> str:
@@ -152,6 +152,8 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
         "Bends (per item)",
         "Bend Complexity",
         "Perimeter (in/item)",
+        "End Perimeter Both Ends (in/item)",
+        "Total End Perimeter Both Ends (in)",
         "Feedrate (IPM)",
         "Weight per Foot (lbs/ft)",
         "Cross-sectional Area (in^2)",
@@ -183,6 +185,38 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     for r in rows:
         w.writerow(r)
     return buf.getvalue().encode("utf-8")
+
+
+def _structural_end_perimeter_one_end_in(props: Dict[str, Any]) -> float:
+    """Approximate end perimeter (inches) for ONE end of a structural shape from AISC props."""
+    shape = str(props.get("Shape", "") or props.get("Type", "") or "").upper()
+
+    # HSS / Tube / Pipe
+    if "HSS" in shape:
+        # Rectangular HSS: use B and Ht if available
+        b = float(props.get("B_float", 0.0) or 0.0)
+        h = float(props.get("Ht_float", 0.0) or 0.0)
+        if b > 0 and h > 0:
+            return 2.0 * (b + h)
+
+        # Round HSS sometimes comes as OD
+        od = float(props.get("OD_float", 0.0) or 0.0)
+        if od > 0:
+            return math.pi * od
+
+    if "PIPE" in shape or "TUBE" in shape:
+        od = float(props.get("OD_float", 0.0) or 0.0)
+        if od > 0:
+            return math.pi * od
+
+    # Wide flange / channel / angle / misc: use envelope if we have bf and d
+    bf = float(props.get("bf_float", 0.0) or 0.0)
+    d = float(props.get("d_float", 0.0) or 0.0)
+    if bf > 0 and d > 0:
+        return 2.0 * (bf + d)
+
+    # Fallback: no data
+    return 0.0
 
 
 def page_plate() -> None:
@@ -232,7 +266,6 @@ def page_plate() -> None:
             accept_multiple_files=True,
             key="step_upload_multi",
         )
-
 
         def _units_to_inches_factor(units_label: str) -> float:
             label = (units_label or "").lower()
@@ -297,6 +330,10 @@ def page_plate() -> None:
               - combined mesh in inches (for preview)
               - parts list: [{name, bbox_w_in, bbox_l_in, bbox_h_in, volume_in3, mesh_in}]
             Note: meshes are scaled to INCHES inside this function.
+
+            Thickness rule:
+              - smallest bbox dimension is treated as thickness
+              - the other two become width/length (width <= length)
             """
             import trimesh
 
@@ -334,6 +371,7 @@ def page_plate() -> None:
 
                     dims = sorted([float(ext[0]), float(ext[1]), float(ext[2])])
                     t_in, w_in, l_in = float(dims[0]), float(dims[1]), float(dims[2])
+
                     parts.append(
                         {
                             "name": str(name),
@@ -395,6 +433,10 @@ def page_plate() -> None:
             - If STEP is an assembly/multi-body (trimesh.Scene), each geometry becomes a row.
             - If STEP is a single part (trimesh.Trimesh), you get one row.
 
+            Thickness rule:
+              - smallest bbox dimension is treated as thickness
+              - the other two become width/length (width <= length)
+
             Returns:
               (df_parts, meshes_by_row_id)
             """
@@ -438,6 +480,16 @@ def page_plate() -> None:
 
             rows = []
             meshes_by_id = {}
+
+            def _snap_thickness_to_list(t_in: float) -> float:
+                """Snap inferred thickness to nearest value in logic.THICKNESS_LIST (keeps editor/selectbox valid)."""
+                try:
+                    opts = [float(x) for x in logic.THICKNESS_LIST]
+                    if not opts:
+                        return float(t_in)
+                    return float(min(opts, key=lambda x: abs(x - float(t_in))))
+                except Exception:
+                    return float(t_in)
 
             if isinstance(scene_or_mesh, trimesh.Scene):
                 for gname, geom in scene_or_mesh.geometry.items():
@@ -489,7 +541,6 @@ def page_plate() -> None:
 
             return pd.DataFrame(rows), meshes_by_id
 
-
         if step_files:
             import pandas as pd
 
@@ -522,7 +573,8 @@ def page_plate() -> None:
                 st.markdown("#### STEP parts")
                 st.caption(
                     "Select the parts you want to add to the estimate. "
-                    "BBox/Volume/Weight are extracted from STEP. Material/Thickness/Qty are editable."
+                    "BBox/Volume/Weight are extracted from STEP. Smallest bbox dimension is treated as thickness; "
+                    "the other two are width/length. Material/Thickness/Qty are editable."
                 )
 
                 edited = st.data_editor(
@@ -634,7 +686,7 @@ def page_plate() -> None:
                                 "Fit Time (min/item)": float(fit_time_item),
                                 "STEP Volume (in^3)": step_volume,
                                 "STEP Weight (lbs/item)": step_weight,
-                                "STEP Inferred Thickness (in)": bbox_h,
+                                "STEP BBox H (in)": bbox_h,
                                 "STEP Source File": source_file,
                                 "Total Gross Weight (lbs)": round(gross_weight_item * qty, 2),
                                 "Total Burning Run Time (min)": round(burn_time_item * qty, 2),
@@ -653,8 +705,7 @@ def page_plate() -> None:
                         st.success(f"Added {added_n} part(s) from STEP file(s).")
                         st.rerun()
 
-
-# ------------------------------------------------------------
+    # ------------------------------------------------------------
     # DXF Batch Import (Plate Only)
     # ------------------------------------------------------------
     with st.expander("DXF Batch Import (Plate Only)", expanded=False):
@@ -730,7 +781,7 @@ def page_plate() -> None:
                             "True Cut Perimeter (in)": float(part.cut_perimeter_in),
                             "Hole Count": int(part.hole_count),
                             "Total Hole Circumference (in)": float(part.hole_circumference_in),
-                            "Thickness (in)": _snap_thickness_to_list(bh),
+                            "Thickness (in)": float(logic.THICKNESS_LIST[0]),
                             "Grade": str(logic.MATERIALS_LIST[0]),
                             "Quantity": 1,
                         }
@@ -820,9 +871,9 @@ def page_plate() -> None:
                                 "Net Weight (lbs/item)": round(net_weight_item, 2),
                                 "Gross Weight (lbs/item)": round(gross_weight_item, 2),
                                 "Fit Time (min/item)": float(fit_time_item),
-            "STEP Volume (in^3)": float(st.session_state.get("plate_step_volume_in3", 0.0) or 0.0),
-            "STEP Weight (lbs/item)": float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0),
-            "STEP Inferred Thickness (in)": float(st.session_state.get("plate_step_bbox_h_in", 0.0) or 0.0),
+                                "STEP Volume (in^3)": float(st.session_state.get("plate_step_volume_in3", 0.0) or 0.0),
+                                "STEP Weight (lbs/item)": float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0),
+                                "STEP BBox H (in)": float(st.session_state.get("plate_step_bbox_h_in", 0.0) or 0.0),
                                 "Total Gross Weight (lbs)": round(gross_weight_item * quantity, 2),
                                 "Total Burning Time (min)": round(burn_time_item * quantity, 2),
                                 "Total Drilling Time (min)": round(drilling_time_item * quantity, 2),
@@ -866,7 +917,7 @@ def page_plate() -> None:
                 f"STEP loaded: {st.session_state.get('plate_step_loaded_name')} | "
                 f"Volume: {st.session_state.get('plate_step_volume_in3', 0.0):.3f} in³ | "
                 f"Weight: {st.session_state.get('plate_step_weight_lbs', 0.0):.2f} lb | "
-                f"Thickness (inferred): {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
+                f"BBox H: {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
             )
 
         st.markdown("#### Drilling (optional)")
@@ -938,7 +989,7 @@ def page_plate() -> None:
             "Fit Time (min/item)": float(fit_time_item),
             "STEP Volume (in^3)": float(st.session_state.get("plate_step_volume_in3", 0.0) or 0.0),
             "STEP Weight (lbs/item)": float(st.session_state.get("plate_step_weight_lbs", 0.0) or 0.0),
-            "STEP Inferred Thickness (in)": float(st.session_state.get("plate_step_bbox_h_in", 0.0) or 0.0),
+            "STEP BBox H (in)": float(st.session_state.get("plate_step_bbox_h_in", 0.0) or 0.0),
             "Total Gross Weight (lbs)": round(gross_weight_item * quantity, 2),
             "Total Burning Time (min)": round(burn_time_item * quantity, 2),
             "Total Drilling Time (min)": round(drilling_time_item * quantity, 2),
@@ -948,39 +999,6 @@ def page_plate() -> None:
         _add_part(part)
         st.success("Plate added.")
 
-
-
-def _safe_float(v: Any) -> float:
-    try:
-        if v is None:
-            return 0.0
-        s = str(v).strip()
-        if s == "":
-            return 0.0
-        return float(s)
-    except Exception:
-        return 0.0
-
-
-def _struct_end_perimeter_both_ends(props: Dict[str, Any]) -> float:
-    """Approximate inches around the structural cross-section for BOTH ends."""
-    od = _safe_float(props.get("OD"))
-    if od > 0:
-        return float(2.0 * math.pi * od)
-
-    # HSS/rectangular tube dimensions often appear as B and Ht
-    B = _safe_float(props.get("B")) or _safe_float(props.get("b"))
-    Ht = _safe_float(props.get("Ht")) or _safe_float(props.get("h")) or _safe_float(props.get("d"))
-    if B > 0 and Ht > 0 and str(props.get("Type", "")).strip().upper().startswith("HSS"):
-        return float(4.0 * (B + Ht))  # 2 ends
-
-    # Generic envelope fallback for wide-flange / channel / angle etc: 2*(bf + d) per end
-    bf = _safe_float(props.get("bf"))
-    d = _safe_float(props.get("d"))
-    if bf > 0 and d > 0:
-        return float(4.0 * (bf + d))
-
-    return 0.0
 
 def page_structural() -> None:
     st.header("Structural")
@@ -1031,11 +1049,11 @@ def page_structural() -> None:
     add = st.button("Add structural to estimate")
 
     if add:
-                props = logic.AISC_LABEL_TO_PROPERTIES_MAP.get(shape_label, {})
+        props = logic.AISC_LABEL_TO_PROPERTIES_MAP.get(shape_label, {})
         weight_per_foot = float(props.get("W_float", 0.0))
         area_sq_in = float(props.get("A_float", 0.0))
-
-        end_perim_both = _struct_end_perimeter_both_ends(props)
+        end_perim_one = _structural_end_perimeter_one_end_in(props)
+        end_perim_both = 2.0 * float(end_perim_one)
 
         net_wt = logic.calculate_structural_piece_weight(weight_per_foot, length_in)
         gross_wt = logic.calculate_gross_weight(net_wt, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
@@ -1053,9 +1071,9 @@ def page_structural() -> None:
             "Structural Type": structural_type,
             "Shape Label": shape_label,
             "Length (in)": float(length_in),
+            "Mitered Cut": "Yes" if is_mitered else "No",
             "End Perimeter Both Ends (in/item)": round(end_perim_both, 2),
             "Total End Perimeter Both Ends (in)": round(end_perim_both * quantity, 2),
-            "Mitered Cut": "Yes" if is_mitered else "No",
             "Weight per Foot (lbs/ft)": weight_per_foot,
             "Cross-sectional Area (in^2)": area_sq_in,
             "Net Weight (lbs/item)": round(net_wt, 2),
@@ -1148,32 +1166,23 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     drill_t = 0.0
     weld_time_hr = 0.0
     weld_wire_lbs = 0.0
-    plate_perimeter_in = 0.0
-    structural_end_perimeter_in = 0.0
     perimeter_total_in = 0.0
+    structural_end_perimeter_total_in = 0.0
 
     has_plate = any(r.get("Estimation Type") == "Plate" for r in rows)
     has_struct = any(r.get("Estimation Type") == "Structural" for r in rows)
 
     for r in rows:
-        fit_t += float(r.get("Total Fit Time (min)", 0.0) or 0.0)# Plate cut perimeter (Perimeter (in/item)) + Structural end perimeter (Total End Perimeter Both Ends (in))
-try:
-    qty = int(r.get("Quantity", 0) or 0)
-except Exception:
-    qty = 0
+        fit_t += float(r.get("Total Fit Time (min)", 0.0) or 0.0)
 
-try:
-    per_item = float(r.get("Perimeter (in/item)", 0.0) or 0.0)
-    plate_perimeter_in += per_item * qty
-except Exception:
-    pass
+        # Plate perimeter is stored as inches per item; multiply by quantity where available.
+        try:
+            per_item = float(r.get("Perimeter (in/item)", 0.0) or 0.0)
+            qty = int(r.get("Quantity", 0) or 0)
+            perimeter_total_in += per_item * qty
+        except Exception:
+            pass
 
-try:
-    structural_end_perimeter_in += float(r.get("Total End Perimeter Both Ends (in)", 0.0) or 0.0)
-except Exception:
-    pass
-
-perimeter_total_in = plate_perimeter_in + structural_end_perimeter_in
         etype = r.get("Estimation Type")
         if etype == "Plate":
             plate_wt += float(r.get("Total Gross Weight (lbs)", 0.0) or 0.0)
@@ -1185,6 +1194,7 @@ perimeter_total_in = plate_perimeter_in + structural_end_perimeter_in
                 kinetic_burn_t += float(r.get("Total Burning Time (min)", 0.0) or 0.0)
         elif etype == "Structural":
             struct_wt += float(r.get("Total Gross Weight (lbs)", 0.0) or 0.0)
+            structural_end_perimeter_total_in += float(r.get("Total End Perimeter Both Ends (in)", 0.0) or 0.0)
             str_cut_t += float(r.get("Total Cutting Time (min)", 0.0) or 0.0)
         elif etype == "Welding":
             weld_time_hr += float(r.get("Total Weld Time (hours)", 0.0) or 0.0)
@@ -1204,9 +1214,9 @@ perimeter_total_in = plate_perimeter_in + structural_end_perimeter_in
         "grand_total_fit_time": fit_t,
         "grand_total_weld_time_hours": weld_time_hr,
         "grand_total_weld_wire_lbs": weld_wire_lbs,
-        "grand_total_plate_perimeter_in": plate_perimeter_in,
-        "grand_total_structural_end_perimeter_in": structural_end_perimeter_in,
         "grand_total_perimeter_in": perimeter_total_in,
+        "grand_total_structural_end_perimeter_in": structural_end_perimeter_total_in,
+        "grand_total_combined_perimeter_in": perimeter_total_in + structural_end_perimeter_total_in,
         "combined_overall_gross_weight": plate_wt + struct_wt,
         "has_plate_entries": has_plate,
         "has_structural_entries": has_struct,
@@ -1227,7 +1237,13 @@ def page_summary() -> None:
     c1.metric("Total gross weight (lbs)", f"{totals['combined_overall_gross_weight']:.2f}")
     c2.metric("Total fit time (min)", f"{totals['grand_total_fit_time']:.2f}")
     c3.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
-    c4.metric("Total perimeter (in)", f"{totals['grand_total_perimeter_in']:.2f}")
+    c4.metric("Plate perimeter (in)", f"{totals['grand_total_perimeter_in']:.2f}")
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Structural end perimeter (in)", f"{totals.get('grand_total_structural_end_perimeter_in', 0.0):.2f}")
+    p2.metric("Combined perimeter (in)", f"{totals.get('grand_total_combined_perimeter_in', totals['grand_total_perimeter_in']):.2f}")
+    p3.metric("Total plate weight (lbs)", f"{totals['plate_total_gross_weight']:.2f}")
+    p4.metric("Total structural weight (lbs)", f"{totals['structural_total_gross_weight']:.2f}")
 
     # Time breakdown (requested): Saw / Laser / Kinetic
     t1, t2, t3 = st.columns(3)
@@ -1244,9 +1260,9 @@ def page_summary() -> None:
                 "Plate bend (min)": round(totals["grand_total_plate_bend_time"], 2),
                 "Saw time (min)": round(totals.get("grand_total_saw_time", totals.get("grand_total_structural_cutting_time", 0.0)), 2),
                 "Weld wire (lbs)": round(totals["grand_total_weld_wire_lbs"], 2),
-                "Plate cut perimeter (in)": round(totals.get("grand_total_plate_perimeter_in", 0.0), 2),
+                "Plate perimeter (in)": round(totals["grand_total_perimeter_in"], 2),
                 "Structural end perimeter (in)": round(totals.get("grand_total_structural_end_perimeter_in", 0.0), 2),
-                "Total perimeter (in)": round(totals["grand_total_perimeter_in"], 2),
+                "Combined perimeter (in)": round(totals.get("grand_total_combined_perimeter_in", totals["grand_total_perimeter_in"]), 2),
             }
         )
 
