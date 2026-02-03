@@ -570,6 +570,13 @@ def page_plate() -> None:
             else:
                 df_parts = pd.DataFrame(all_rows)
 
+                # Force correct dtypes so Streamlit renders editable checkbox columns
+                try:
+                    df_parts["Include"] = df_parts["Include"].astype(bool)
+                    df_parts["Use STEP weight"] = df_parts["Use STEP weight"].astype(bool)
+                except Exception:
+                    pass
+
                 st.markdown("#### STEP parts")
                 st.caption(
                     "Select the parts you want to add to the estimate. "
