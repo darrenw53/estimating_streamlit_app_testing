@@ -197,6 +197,289 @@ def calculate_yield_for_stock_size(cuts_orig, stock_len):
         cuts_to_make = remaining_cuts
         total_waste += rem_len
     return bars, total_waste
+
+
+# ============================================================
+# Structural nesting (1D cutting stock) — robust multi-length mix
+# ============================================================
+
+def _expand_cuts_from_rows(cuts_with_qty):
+    """Expand [(length, qty), ...] into a flat list of lengths (floats)."""
+    expanded = []
+    if not cuts_with_qty:
+        return expanded
+    for item in cuts_with_qty:
+        try:
+            if isinstance(item, dict):
+                length = float(item.get("length", 0.0) or 0.0)
+                qty = int(item.get("qty", 0) or 0)
+            else:
+                length = float(item[0])
+                qty = int(item[1])
+            if length > 0 and qty > 0:
+                expanded.extend([length] * qty)
+        except Exception:
+            continue
+    return expanded
+
+
+def _pack_one_bar_best_fit(cuts_desc, stock_len, kerf=0.0, end_trim=0.0):
+    """Pack as many cuts as possible into one bar using best-fit on a descending list.
+
+    Returns:
+      used_cuts (list[float]), remaining_cuts (list[float]), waste (float)
+    """
+    kerf = float(kerf or 0.0)
+    end_trim = float(end_trim or 0.0)
+    capacity = float(stock_len) - end_trim
+    if capacity <= 0:
+        return [], list(cuts_desc), float(stock_len)
+
+    used = []
+    remaining = list(cuts_desc)
+
+    # We treat kerf as consumed per piece cut off the bar (simple estimator-friendly model)
+    rem = capacity
+    i = 0
+    while i < len(remaining):
+        c = float(remaining[i])
+        need = c + kerf
+        if need <= rem + 1e-9:
+            used.append(c)
+            rem -= need
+            remaining.pop(i)
+            # restart best-fit search for next piece
+            i = 0
+        else:
+            i += 1
+
+    waste = max(0.0, rem)
+    return used, remaining, waste
+
+
+def optimize_structural_nesting_mix(
+    cuts_with_qty,
+    stock_options,
+    kerf=0.0,
+    end_trim=0.0,
+    objective="waste",
+    n_trials=600,
+    seed=13,
+):
+    """Robust 1D nesting optimizer that can mix multiple stock lengths.
+
+    Args:
+        cuts_with_qty: list of dicts or tuples: [{length:float, qty:int}, ...] or [(len, qty), ...]
+        stock_options: list of dicts: [{length:float, qty:int|None, cost:float|None}, ...]
+            - qty None/0 => unlimited
+        kerf: inches of material lost per cut (approx. per piece)
+        end_trim: inches reserved per bar (clamp/trim allowance)
+        objective: "waste" | "bars" | "cost" | "balanced"
+        n_trials: randomized trials to improve solution quality
+        seed: rng seed (deterministic)
+
+    Returns:
+        solution dict with keys:
+          - bars: list of {stock_len, cuts, waste, used_len}
+          - by_stock: list of {stock_len, bars, total_used, total_waste, utilization}
+          - totals: {bars_used, total_waste, total_stock_len, utilization, total_cost}
+    """
+    import random
+
+    # Normalize / validate inputs
+    cuts = _expand_cuts_from_rows(cuts_with_qty)
+    cuts = [float(c) for c in cuts if float(c) > 0]
+    if not cuts:
+        return {"bars": [], "by_stock": [], "totals": {"bars_used": 0, "total_waste": 0.0, "utilization": 0.0, "total_cost": 0.0}}
+
+    opts = []
+    for o in (stock_options or []):
+        try:
+            L = float(o.get("length", 0.0) or 0.0)
+            if L <= 0:
+                continue
+            qty = o.get("qty", None)
+            qty = None if qty in (None, "", 0) else int(qty)
+            cost = o.get("cost", None)
+            cost = None if cost in (None, "") else float(cost)
+            opts.append({"length": L, "qty": qty, "cost": cost})
+        except Exception:
+            continue
+    if not opts:
+        return {"bars": [], "by_stock": [], "totals": {"bars_used": 0, "total_waste": 0.0, "utilization": 0.0, "total_cost": 0.0}}
+
+    # Remove impossible cuts (longer than every usable stock minus trim)
+    max_cap = max(float(o["length"]) - float(end_trim or 0.0) for o in opts)
+    feasible = [c for c in cuts if c + float(kerf or 0.0) <= max_cap + 1e-9]
+    infeasible = [c for c in cuts if c not in feasible]
+    cuts = feasible
+    if not cuts:
+        return {
+            "bars": [],
+            "by_stock": [],
+            "totals": {"bars_used": 0, "total_waste": 0.0, "utilization": 0.0, "total_cost": 0.0},
+            "infeasible_cuts": infeasible,
+        }
+
+    rng = random.Random(int(seed))
+
+    def score_solution(bars):
+        total_waste = sum(b["waste"] for b in bars)
+        bars_used = len(bars)
+        total_cost = 0.0
+        for b in bars:
+            L = b["stock_len"]
+            # cost per bar if provided, otherwise 0
+            cost = 0.0
+            for o in opts:
+                if abs(o["length"] - L) < 1e-9 and o.get("cost") is not None:
+                    cost = float(o["cost"])
+                    break
+            total_cost += cost
+
+        if objective == "bars":
+            return (bars_used, total_waste, total_cost)
+        if objective == "cost":
+            return (total_cost, total_waste, bars_used)
+        if objective == "balanced":
+            # estimator-friendly weighting: prefer fewer bars, then waste, then cost
+            return (bars_used * 100000.0 + total_waste * 10.0 + total_cost)
+        # default: minimize waste, then bars, then cost
+        return (total_waste, bars_used, total_cost)
+
+    def build_trial(cuts_list, opts_list):
+        # Track remaining stock quantities
+        qty_left = {}
+        for o in opts_list:
+            qty_left[o["length"]] = None if o.get("qty") is None else int(o.get("qty"))
+
+        remaining = sorted(cuts_list, reverse=True)
+        bars = []
+
+        while remaining:
+            biggest = remaining[0]
+
+            # Choose best stock length for this step
+            candidates = []
+            for o in opts_list:
+                L = float(o["length"])
+                q = qty_left.get(L, None)
+                if q is not None and q <= 0:
+                    continue
+                if biggest + float(kerf or 0.0) > (L - float(end_trim or 0.0)) + 1e-9:
+                    continue
+
+                used, rem_after, waste = _pack_one_bar_best_fit(remaining, L, kerf=kerf, end_trim=end_trim)
+                if not used:
+                    continue
+
+                used_len = sum(used) + float(kerf or 0.0) * len(used)
+                # Local heuristic score: waste first, then prefer using more material
+                local = (waste, -used_len)
+                candidates.append((local, L, used, rem_after, waste, used_len))
+
+            if not candidates:
+                # Shouldn't happen due to feasibility filter, but guard anyway
+                break
+
+            candidates.sort(key=lambda x: x[0])
+            # Small randomness to escape local minima
+            pick_idx = 0
+            if len(candidates) > 1:
+                pick_idx = 0 if rng.random() < 0.80 else min(len(candidates) - 1, 1)
+            _, chosen_L, used, rem_after, waste, used_len = candidates[pick_idx]
+
+            bars.append({
+                "stock_len": float(chosen_L),
+                "cuts": used,
+                "used_len": float(used_len),
+                "waste": float(waste),
+            })
+
+            remaining = sorted(rem_after, reverse=True)
+
+            q = qty_left.get(chosen_L, None)
+            if q is not None:
+                qty_left[chosen_L] = q - 1
+
+        return bars
+
+    best_bars = None
+    best_score = None
+
+    # Base deterministic trial first
+    base = build_trial(cuts, sorted(opts, key=lambda o: o["length"], reverse=True))
+    best_bars = base
+    best_score = score_solution(base)
+
+    # Randomized improvements
+    for _ in range(max(0, int(n_trials))):
+        trial_cuts = list(cuts)
+        rng.shuffle(trial_cuts)
+        # Bias: keep larger pieces early
+        trial_cuts = sorted(trial_cuts[:], reverse=True) if rng.random() < 0.6 else trial_cuts
+
+        trial_opts = list(opts)
+        if rng.random() < 0.7:
+            # prefer larger stock first most of the time
+            trial_opts.sort(key=lambda o: o["length"], reverse=True)
+        else:
+            rng.shuffle(trial_opts)
+
+        bars = build_trial(trial_cuts, trial_opts)
+        sc = score_solution(bars)
+        if best_score is None or sc < best_score:
+            best_score = sc
+            best_bars = bars
+
+    # Summaries
+    bars = best_bars or []
+    total_stock_len = sum(b["stock_len"] for b in bars)
+    total_waste = sum(b["waste"] for b in bars)
+    total_used = sum(b["used_len"] for b in bars)
+    utilization = (total_used / total_stock_len) if total_stock_len > 0 else 0.0
+
+    # cost
+    total_cost = 0.0
+    for b in bars:
+        L = b["stock_len"]
+        for o in opts:
+            if abs(o["length"] - L) < 1e-9 and o.get("cost") is not None:
+                total_cost += float(o["cost"])
+                break
+
+    # group by stock length
+    by = {}
+    for b in bars:
+        L = b["stock_len"]
+        by.setdefault(L, {"stock_len": L, "bars": 0, "total_used": 0.0, "total_waste": 0.0})
+        by[L]["bars"] += 1
+        by[L]["total_used"] += float(b["used_len"])
+        by[L]["total_waste"] += float(b["waste"])
+    by_stock = []
+    for L in sorted(by.keys(), reverse=True):
+        rec = by[L]
+        tot = rec["bars"] * float(L)
+        rec["utilization"] = (rec["total_used"] / tot) if tot > 0 else 0.0
+        by_stock.append(rec)
+
+    sol = {
+        "bars": bars,
+        "by_stock": by_stock,
+        "totals": {
+            "bars_used": len(bars),
+            "total_waste": float(round(total_waste, 3)),
+            "total_stock_len": float(round(total_stock_len, 3)),
+            "total_used": float(round(total_used, 3)),
+            "utilization": float(utilization),
+            "total_cost": float(round(total_cost, 2)),
+        },
+    }
+    if infeasible:
+        sol["infeasible_cuts"] = infeasible
+    return sol
+
+
 def calculate_plate_nesting_yield(required_parts, stock_w, stock_h, allow_rot=True):
     if not required_parts or not stock_w > 0 or not stock_h > 0: return 0, []
     all_p = [];
