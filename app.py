@@ -949,6 +949,39 @@ def page_plate() -> None:
         st.success("Plate added.")
 
 
+
+def _safe_float(v: Any) -> float:
+    try:
+        if v is None:
+            return 0.0
+        s = str(v).strip()
+        if s == "":
+            return 0.0
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def _struct_end_perimeter_both_ends(props: Dict[str, Any]) -> float:
+    """Approximate inches around the structural cross-section for BOTH ends."""
+    od = _safe_float(props.get("OD"))
+    if od > 0:
+        return float(2.0 * math.pi * od)
+
+    # HSS/rectangular tube dimensions often appear as B and Ht
+    B = _safe_float(props.get("B")) or _safe_float(props.get("b"))
+    Ht = _safe_float(props.get("Ht")) or _safe_float(props.get("h")) or _safe_float(props.get("d"))
+    if B > 0 and Ht > 0 and str(props.get("Type", "")).strip().upper().startswith("HSS"):
+        return float(4.0 * (B + Ht))  # 2 ends
+
+    # Generic envelope fallback for wide-flange / channel / angle etc: 2*(bf + d) per end
+    bf = _safe_float(props.get("bf"))
+    d = _safe_float(props.get("d"))
+    if bf > 0 and d > 0:
+        return float(4.0 * (bf + d))
+
+    return 0.0
+
 def page_structural() -> None:
     st.header("Structural")
     if not logic.AISC_TYPES_TO_LABELS_MAP:
@@ -998,9 +1031,11 @@ def page_structural() -> None:
     add = st.button("Add structural to estimate")
 
     if add:
-        props = logic.AISC_LABEL_TO_PROPERTIES_MAP.get(shape_label, {})
+                props = logic.AISC_LABEL_TO_PROPERTIES_MAP.get(shape_label, {})
         weight_per_foot = float(props.get("W_float", 0.0))
         area_sq_in = float(props.get("A_float", 0.0))
+
+        end_perim_both = _struct_end_perimeter_both_ends(props)
 
         net_wt = logic.calculate_structural_piece_weight(weight_per_foot, length_in)
         gross_wt = logic.calculate_gross_weight(net_wt, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
@@ -1018,6 +1053,8 @@ def page_structural() -> None:
             "Structural Type": structural_type,
             "Shape Label": shape_label,
             "Length (in)": float(length_in),
+            "End Perimeter Both Ends (in/item)": round(end_perim_both, 2),
+            "Total End Perimeter Both Ends (in)": round(end_perim_both * quantity, 2),
             "Mitered Cut": "Yes" if is_mitered else "No",
             "Weight per Foot (lbs/ft)": weight_per_foot,
             "Cross-sectional Area (in^2)": area_sq_in,
@@ -1111,21 +1148,32 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     drill_t = 0.0
     weld_time_hr = 0.0
     weld_wire_lbs = 0.0
+    plate_perimeter_in = 0.0
+    structural_end_perimeter_in = 0.0
     perimeter_total_in = 0.0
 
     has_plate = any(r.get("Estimation Type") == "Plate" for r in rows)
     has_struct = any(r.get("Estimation Type") == "Structural" for r in rows)
 
     for r in rows:
-        fit_t += float(r.get("Total Fit Time (min)", 0.0) or 0.0)
+        fit_t += float(r.get("Total Fit Time (min)", 0.0) or 0.0)# Plate cut perimeter (Perimeter (in/item)) + Structural end perimeter (Total End Perimeter Both Ends (in))
+try:
+    qty = int(r.get("Quantity", 0) or 0)
+except Exception:
+    qty = 0
 
-        # Perimeter is stored as inches per item; multiply by quantity where available.
-        try:
-            per_item = float(r.get("Perimeter (in/item)", 0.0) or 0.0)
-            qty = int(r.get("Quantity", 0) or 0)
-            perimeter_total_in += per_item * qty
-        except Exception:
-            pass
+try:
+    per_item = float(r.get("Perimeter (in/item)", 0.0) or 0.0)
+    plate_perimeter_in += per_item * qty
+except Exception:
+    pass
+
+try:
+    structural_end_perimeter_in += float(r.get("Total End Perimeter Both Ends (in)", 0.0) or 0.0)
+except Exception:
+    pass
+
+perimeter_total_in = plate_perimeter_in + structural_end_perimeter_in
         etype = r.get("Estimation Type")
         if etype == "Plate":
             plate_wt += float(r.get("Total Gross Weight (lbs)", 0.0) or 0.0)
@@ -1156,6 +1204,8 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "grand_total_fit_time": fit_t,
         "grand_total_weld_time_hours": weld_time_hr,
         "grand_total_weld_wire_lbs": weld_wire_lbs,
+        "grand_total_plate_perimeter_in": plate_perimeter_in,
+        "grand_total_structural_end_perimeter_in": structural_end_perimeter_in,
         "grand_total_perimeter_in": perimeter_total_in,
         "combined_overall_gross_weight": plate_wt + struct_wt,
         "has_plate_entries": has_plate,
@@ -1194,6 +1244,8 @@ def page_summary() -> None:
                 "Plate bend (min)": round(totals["grand_total_plate_bend_time"], 2),
                 "Saw time (min)": round(totals.get("grand_total_saw_time", totals.get("grand_total_structural_cutting_time", 0.0)), 2),
                 "Weld wire (lbs)": round(totals["grand_total_weld_wire_lbs"], 2),
+                "Plate cut perimeter (in)": round(totals.get("grand_total_plate_perimeter_in", 0.0), 2),
+                "Structural end perimeter (in)": round(totals.get("grand_total_structural_end_perimeter_in", 0.0), 2),
                 "Total perimeter (in)": round(totals["grand_total_perimeter_in"], 2),
             }
         )
