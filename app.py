@@ -871,17 +871,70 @@ def page_plate() -> None:
 
     # ------------------------------------------------------------
     # Manual Plate entry (supports drilling + rolling)
+    # NOTE: Rolling controls MUST be outside st.form for dynamic reveal
     # ------------------------------------------------------------
+
+    # Rolling controls OUTSIDE the form so they reveal immediately
+    st.markdown("#### Rolling (optional)")
+    rolling_required = st.checkbox("Rolling required", value=False, key="plate_roll_required")
+
+    # Defaults (in case not required)
+    rolling_type = st.session_state.get("plate_roll_type", "Cylinder")
+    rolling_od_bucket = st.session_state.get("plate_roll_od", "Large OD (60\"+)")
+    rolling_prebend = st.session_state.get("plate_roll_prebend", False)
+    rolling_tight_tol = st.session_state.get("plate_roll_tighttol", False)
+
+    if rolling_required:
+        r1, r2, r3, r4 = st.columns([1, 1, 1, 1])
+        with r1:
+            rolling_type = st.selectbox("Rolling type", ["Cylinder", "Cone"], index=0, key="plate_roll_type")
+        with r2:
+            rolling_od_bucket = st.selectbox(
+                "OD bucket",
+                ["Small OD (<24\")", "Medium OD (24–60\")", "Large OD (60\"+)"],
+                index=2,
+                key="plate_roll_od",
+            )
+        with r3:
+            rolling_prebend = st.checkbox("Prebend", value=False, key="plate_roll_prebend")
+        with r4:
+            rolling_tight_tol = st.checkbox("Tight tolerance", value=False, key="plate_roll_tighttol")
+
+    st.divider()
+
+    # Form for plate + drilling + STEP weight toggle
     with st.form("plate_form"):
         c1, c2 = st.columns(2)
         with c1:
-            part_name = st.text_input("Part name", value=st.session_state.get("plate_part_name", "Unnamed Plate"), key="plate_part_name")
-            quantity = st.number_input("Quantity", min_value=1, value=int(st.session_state.get("plate_qty", 1)), step=1, key="plate_qty")
+            part_name = st.text_input(
+                "Part name",
+                value=st.session_state.get("plate_part_name", "Unnamed Plate"),
+                key="plate_part_name",
+            )
+            quantity = st.number_input(
+                "Quantity",
+                min_value=1,
+                value=int(st.session_state.get("plate_qty", 1)),
+                step=1,
+                key="plate_qty",
+            )
             material = st.selectbox("Material", options=logic.MATERIALS_LIST, index=0, key="plate_mat")
             thickness = st.selectbox("Thickness (in)", options=logic.THICKNESS_LIST, index=0, key="plate_thk")
         with c2:
-            width = st.number_input("Width (in)", min_value=0.0, value=float(st.session_state.get("plate_w", 0.0)), step=0.25, key="plate_w")
-            length = st.number_input("Length (in)", min_value=0.0, value=float(st.session_state.get("plate_l", 0.0)), step=0.25, key="plate_l")
+            width = st.number_input(
+                "Width (in)",
+                min_value=0.0,
+                value=float(st.session_state.get("plate_w", 0.0)),
+                step=0.25,
+                key="plate_w",
+            )
+            length = st.number_input(
+                "Length (in)",
+                min_value=0.0,
+                value=float(st.session_state.get("plate_l", 0.0)),
+                step=0.25,
+                key="plate_l",
+            )
             num_bends = st.number_input("Bends (per item)", min_value=0, value=0, step=1)
             bend_complexity = st.selectbox("Bend complexity", options=["N/A"] + logic.BEND_COMPLEXITY_OPTIONS, index=0)
             if num_bends == 0:
@@ -907,29 +960,6 @@ def page_plate() -> None:
             hole_dia_3 = st.number_input("Hole 3 dia (in)", min_value=0.0, value=0.0, step=0.0625)
             hole_qty_3 = st.number_input("Hole 3 qty", min_value=0, value=0, step=1)
 
-        st.markdown("#### Rolling (optional)")
-        rolling_required = st.checkbox("Rolling required", value=False, key="plate_roll_required")
-        rolling_type = "Cylinder"
-        rolling_od_bucket = "Large OD (easiest)"
-        rolling_prebend = False
-        rolling_tight_tol = False
-
-        if rolling_required:
-            r1, r2, r3, r4 = st.columns([1, 1, 1, 1])
-            with r1:
-                rolling_type = st.selectbox("Rolling type", ["Cylinder", "Cone"], index=0, key="plate_roll_type")
-            with r2:
-                rolling_od_bucket = st.selectbox(
-                    "OD bucket",
-                    ["Small OD (<24\")", "Medium OD (24–60\")", "Large OD (60\"+)"],
-                    index=2,
-                    key="plate_roll_od",
-                )
-            with r3:
-                rolling_prebend = st.checkbox("Prebend", value=False, key="plate_roll_prebend")
-            with r4:
-                rolling_tight_tol = st.checkbox("Tight tolerance", value=False, key="plate_roll_tighttol")
-
         st.markdown("#### STEP Weight (optional)")
         use_step_weight = st.checkbox(
             "Use STEP-derived weight for fit time (and reporting)",
@@ -940,6 +970,7 @@ def page_plate() -> None:
 
         add = st.form_submit_button("Add plate to estimate")
 
+    # Handle add AFTER the form submits (but uses rolling values from outside form)
     if add:
         fake_form = {
             "hole_dia_1": hole_dia_1,
@@ -1028,7 +1059,6 @@ def page_plate() -> None:
         _add_part(part)
         st.success("Plate added.")
         st.rerun()
-
 
 def page_structural() -> None:
     st.header("Structural")
