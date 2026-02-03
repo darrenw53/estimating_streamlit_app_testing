@@ -197,32 +197,76 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
 
 
 def _structural_end_perimeter_one_end_in(props: Dict[str, Any]) -> float:
-    """Approximate end perimeter (inches) for ONE end of a structural shape from AISC props."""
-    shape = str(props.get("Shape", "") or props.get("Type", "") or "").upper()
+    """Approximate end perimeter (inches) for ONE end of a structural shape from AISC props.
 
-    # HSS rectangular: 2*(B+H)
-    if "HSS" in shape:
-        b = float(props.get("B_float", 0.0) or 0.0)
-        h = float(props.get("Ht_float", 0.0) or 0.0)
+    Notes:
+    - Our AISC CSV loader stores most numeric columns as strings plus a few *_float keys.
+    - This helper defensively looks for both raw AISC column names (e.g. 'bf', 'd', 'B', 'Ht', 'OD')
+      and any pre-parsed '*_float' variants that may exist.
+    """
+
+    def _get_float(*keys: str) -> float:
+        for k in keys:
+            if not k:
+                continue
+            # try exact key, then a common '*_float' variant
+            for kk in (k, f"{k}_float"):
+                if kk in props and props.get(kk) not in (None, ""):
+                    try:
+                        return float(props.get(kk))
+                    except Exception:
+                        pass
+            # also try case-insensitive match (AISC columns are case-sensitive but we stay robust)
+            lk = k.lower()
+            for pk, pv in props.items():
+                if str(pk).lower() == lk and pv not in (None, ""):
+                    try:
+                        return float(pv)
+                    except Exception:
+                        pass
+        return 0.0
+
+    shape = str(props.get("Shape", "") or props.get("Type", "") or "").upper()
+    label = str(props.get("EDI_Std_Nomenclature", "") or props.get("Label", "") or "").upper()
+    blob = f"{shape} {label}"
+
+    # -------------------------
+    # HSS (rectangular / square)
+    # -------------------------
+    if "HSS" in blob:
+        # AISC uses B and Ht for rectangular HSS (outside dimensions)
+        b = _get_float("B", "b")
+        h = _get_float("Ht", "H", "h")
         if b > 0 and h > 0:
             return 2.0 * (b + h)
 
-        # HSS round fallback
-        od = float(props.get("OD_float", 0.0) or 0.0)
+        # HSS round fallback: pi*OD
+        od = _get_float("OD", "ODt", "D", "d")
         if od > 0:
             return math.pi * od
 
-    # Pipe / Tube: pi*OD
-    if "PIPE" in shape or "TUBE" in shape:
-        od = float(props.get("OD_float", 0.0) or 0.0)
+    # -------------
+    # Pipe / Tube
+    # -------------
+    if "PIPE" in blob or "TUBE" in blob:
+        od = _get_float("OD", "ODt", "D", "d")
         if od > 0:
             return math.pi * od
 
-    # Wide-flange or general fallback: 2*(bf+d) if available
-    bf = float(props.get("bf_float", 0.0) or 0.0)
-    d = float(props.get("d_float", 0.0) or 0.0)
+    # -----------------------------------------
+    # Wide-flange / channel / general fallback
+    # -----------------------------------------
+    # Typical AISC columns: bf and d
+    bf = _get_float("bf", "BF")
+    d = _get_float("d", "D")
     if bf > 0 and d > 0:
         return 2.0 * (bf + d)
+
+    # Last resort: if only area is known, approximate a square perimeter with same area:
+    #   A = s^2 => s = sqrt(A) => perimeter = 4s
+    a = _get_float("A", "A_float")
+    if a > 0:
+        return 4.0 * math.sqrt(a)
 
     return 0.0
 
@@ -1464,12 +1508,10 @@ def page_summary() -> None:
     p2.metric("Structural end perimeter (in)", f"{totals['grand_total_structural_end_perimeter_in']:.2f}")
     p3.metric("Combined perimeter (in)", f"{totals['grand_total_combined_perimeter_in']:.2f}")
 
-    # Cutting / processing time rollups
-    t1, t2, t3, t4 = st.columns(4)
+    t1, t2, t3 = st.columns(3)
     t1.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
     t2.metric("Kinetic time (min)", f"{totals['grand_total_kinetic_burn_time']:.2f}")
     t3.metric("Plate drilling (min)", f"{totals['grand_total_plate_drilling_time']:.2f}")
-    t4.metric("Saw time (min)", f"{totals['grand_total_structural_cutting_time']:.2f}")
 
     with st.expander("Estimate line items", expanded=False):
         st.dataframe(rows, use_container_width=True)
