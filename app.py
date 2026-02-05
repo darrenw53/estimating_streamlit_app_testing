@@ -20,7 +20,7 @@ from dxf_plate import parse_dxf_plate_single_part_geometry, render_part_thumbnai
 # - Optional password protection via Streamlit secrets
 # ============================================================
 
-APP_TITLE = "Estimating Calculator(V2)"
+APP_TITLE = "Estimating Calculator(V3)"
 
 
 def _init_state() -> None:
