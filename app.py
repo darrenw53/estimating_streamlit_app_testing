@@ -541,6 +541,7 @@ def page_cone_calculator() -> None:
             "Fit Time (min/item)": float(fit_time_g),
             "Total Gross Weight (lbs)": round(float(gross_weight_g) * int(quantity), 2),
             "Total Burning Time (min)": round(float(burn_time_g) * int(quantity), 2),
+            "Total Drillingilling Time (min)": 0.0,
             "Total Drilling Time (min)": 0.0,
             "Total Bend Time (min)": 0.0,
             "Total Rolling Run Time (min)": float(total_rolling_time),
@@ -883,7 +884,11 @@ def page_plate() -> None:
                     except Exception as e:
                         st.warning(f"Preview failed: {e}")
 
-                add_selected = st.button("Add selected STEP parts to estimate (no drilling/rolling)", type="secondary", key="step_add_selected_multi")
+                add_selected = st.button(
+                    "Add selected STEP parts to estimate (no drilling/rolling)",
+                    type="secondary",
+                    key="step_add_selected_multi",
+                )
                 if add_selected:
                     added_n = 0
                     for _, r in edited.iterrows():
@@ -1736,11 +1741,17 @@ def page_summary() -> None:
 
     totals = _compute_totals(rows)
 
+    # Keep the top row exactly the same look/ordering as before
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total gross weight (lbs)", f"{totals['combined_overall_gross_weight']:.2f}")
     c2.metric("Total fit time (min)", f"{totals['grand_total_fit_time']:.2f}")
     c3.metric("Roll time (min)", f"{totals['grand_total_roll_time']:.2f}")
     c4.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
+
+    # NEW: Separate Plate vs Structural gross weight (added under the existing top row)
+    w1, w2 = st.columns(2)
+    w1.metric("Plate gross weight (lbs)", f"{totals['plate_total_gross_weight']:.2f}")
+    w2.metric("Structural gross weight (lbs)", f"{totals['structural_total_gross_weight']:.2f}")
 
     p1, p2, p3 = st.columns(3)
     p1.metric("Plate cut perimeter (in)", f"{totals['grand_total_plate_perimeter_in']:.2f}")
