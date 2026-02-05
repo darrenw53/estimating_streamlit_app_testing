@@ -3,7 +3,7 @@ import os
 import hmac
 import datetime
 import math
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
 import streamlit as st
 from PIL import Image, ImageDraw, ImageFont
@@ -197,26 +197,18 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
 
 
 def _structural_end_perimeter_one_end_in(props: Dict[str, Any]) -> float:
-    """Approximate end perimeter (inches) for ONE end of a structural shape from AISC props.
-
-    Notes:
-    - Our AISC CSV loader stores most numeric columns as strings plus a few *_float keys.
-    - This helper defensively looks for both raw AISC column names (e.g. 'bf', 'd', 'B', 'Ht', 'OD')
-      and any pre-parsed '*_float' variants that may exist.
-    """
+    """Approximate end perimeter (inches) for ONE end of a structural shape from AISC props."""
 
     def _get_float(*keys: str) -> float:
         for k in keys:
             if not k:
                 continue
-            # try exact key, then a common '*_float' variant
             for kk in (k, f"{k}_float"):
                 if kk in props and props.get(kk) not in (None, ""):
                     try:
                         return float(props.get(kk))
                     except Exception:
                         pass
-            # also try case-insensitive match (AISC columns are case-sensitive but we stay robust)
             lk = k.lower()
             for pk, pv in props.items():
                 if str(pk).lower() == lk and pv not in (None, ""):
@@ -230,46 +222,86 @@ def _structural_end_perimeter_one_end_in(props: Dict[str, Any]) -> float:
     label = str(props.get("EDI_Std_Nomenclature", "") or props.get("Label", "") or "").upper()
     blob = f"{shape} {label}"
 
-    # -------------------------
-    # HSS (rectangular / square)
-    # -------------------------
     if "HSS" in blob:
-        # AISC uses B and Ht for rectangular HSS (outside dimensions)
         b = _get_float("B", "b")
         h = _get_float("Ht", "H", "h")
         if b > 0 and h > 0:
             return 2.0 * (b + h)
 
-        # HSS round fallback: pi*OD
         od = _get_float("OD", "ODt", "D", "d")
         if od > 0:
             return math.pi * od
 
-    # -------------
-    # Pipe / Tube
-    # -------------
     if "PIPE" in blob or "TUBE" in blob:
         od = _get_float("OD", "ODt", "D", "d")
         if od > 0:
             return math.pi * od
 
-    # -----------------------------------------
-    # Wide-flange / channel / general fallback
-    # -----------------------------------------
-    # Typical AISC columns: bf and d
     bf = _get_float("bf", "BF")
     d = _get_float("d", "D")
     if bf > 0 and d > 0:
         return 2.0 * (bf + d)
 
-    # Last resort: if only area is known, approximate a square perimeter with same area:
-    #   A = s^2 => s = sqrt(A) => perimeter = 4s
     a = _get_float("A", "A_float")
     if a > 0:
         return 4.0 * math.sqrt(a)
 
     return 0.0
 
+
+# ============================================================
+# Setup time helpers (NEW)
+# ============================================================
+
+SETUP_MINUTES_PER_UNIQUE_MAT_THK = 30.0
+
+
+def _safe_setup_key(material: Any, thickness: Any) -> Tuple[str, float]:
+    """Normalize material/thickness into a stable hashable key."""
+    mat = "" if material is None else str(material).strip()
+    try:
+        thk = float(thickness)
+    except Exception:
+        thk = 0.0
+    return (mat, thk)
+
+
+def _calculate_setup_times(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+    """
+    Calculate setup times (minutes), separate from runtime:
+    - Laser: Plate items whose Burn Machine Type == "Laser"
+    - Kinetic: Plate items whose Burn Machine Type == "Kinetic"
+    - Saw: Structural items (cutting)
+    Rule: 30 minutes per unique (Material, Thickness) per process.
+    """
+
+    laser_keys = set()
+    kinetic_keys = set()
+    saw_keys = set()
+
+    for r in rows:
+        etype = r.get("Estimation Type")
+        if etype == "Plate":
+            key = _safe_setup_key(r.get("Material"), r.get("Thickness (in)"))
+            burn_type = r.get("Burn Machine Type")
+            if burn_type == "Laser":
+                laser_keys.add(key)
+            elif burn_type == "Kinetic":
+                kinetic_keys.add(key)
+
+        elif etype == "Structural":
+            # Structural doesn't currently store Material/Thickness; use a single setup bucket.
+            # If you add struct material/grade later, we can key off that too.
+            saw_keys.add(("STRUCTURAL", 0.0))
+
+    return {
+        "laser_setup_min": float(len(laser_keys)) * SETUP_MINUTES_PER_UNIQUE_MAT_THK,
+        "kinetic_setup_min": float(len(kinetic_keys)) * SETUP_MINUTES_PER_UNIQUE_MAT_THK,
+        "saw_setup_min": float(len(saw_keys)) * SETUP_MINUTES_PER_UNIQUE_MAT_THK,
+        "laser_setup_count": float(len(laser_keys)),
+        "kinetic_setup_count": float(len(kinetic_keys)),
+        "saw_setup_count": float(len(saw_keys)),
+    }
 
 
 # ============================================================
@@ -283,13 +315,9 @@ def _rolling_time_minutes_per_item(
     prebend: bool,
     tight_tolerance: bool,
 ) -> float:
-    """Heuristic rolling runtime (minutes/item) based on part weight + options.
-
-    NOTE: This is intentionally simple. Adjust buckets/multipliers to match Weldall actuals.
-    """
+    """Heuristic rolling runtime (minutes/item) based on part weight + options."""
     w = max(0.0, float(weight_lbs or 0.0))
 
-    # Base time by weight bucket (minutes)
     if w <= 250:
         base = 15
     elif w <= 500:
@@ -312,23 +340,17 @@ def _rolling_time_minutes_per_item(
         base *= 1.20
     elif "medium" in bucket:
         base *= 1.10
-    # large bucket: no multiplier
 
     if prebend:
-        base += 15  # +0.25 hr
+        base += 15
     if tight_tolerance:
-        base += 30  # +0.50 hr
+        base += 30
 
     return float(round(base, 2))
 
 
 def _cone_development_truncated(D1: float, D2: float, H: float, use_mean_diam: bool, thickness: float) -> Dict[str, float]:
-    """Truncated cone development as an annular sector.
-
-    D1 = large diameter, D2 = small diameter, H = vertical height (all same units; we use inches in the UI)
-    If use_mean_diam is True, we approximate by using mean radii (OD/2 - t/2).
-    Returns: Rin, Rout, theta_rad, theta_deg, arc_in, arc_out, slant_small, slant_large
-    """
+    """Truncated cone development as an annular sector."""
     if D1 <= 0 or D2 < 0 or H <= 0:
         raise ValueError("D1 must be > 0, D2 must be >= 0, H must be > 0.")
     r_large = D1 / 2.0
@@ -340,14 +362,10 @@ def _cone_development_truncated(D1: float, D2: float, H: float, use_mean_diam: b
     if r_large <= r_small:
         raise ValueError("Large diameter must be greater than small diameter.")
 
-    # Full cone height from apex to large end (similar triangles)
     H_full = H * (r_large / (r_large - r_small))
-
-    # Slant lengths from apex to each end
     slant_large = math.sqrt(H_full**2 + r_large**2)
     slant_small = math.sqrt((H_full - H)**2 + r_small**2)
 
-    # Included angle: theta * slant_large = circumference at large end
     theta_rad = (2.0 * math.pi * r_large) / slant_large
     theta_deg = math.degrees(theta_rad)
 
@@ -411,7 +429,6 @@ def page_cone_calculator() -> None:
         rolling_prebend = st.checkbox("Prebend", value=False, key="cone_roll_prebend")
         rolling_tight_tol = st.checkbox("Tight tolerance", value=False, key="cone_roll_tighttol")
 
-    # Compute development
     try:
         dev = _cone_development_truncated(
             D1=float(D1),
@@ -429,7 +446,6 @@ def page_cone_calculator() -> None:
     theta_rad = float(dev["theta_rad"])
     theta_deg = float(dev["theta_deg"])
 
-    # Per-gore
     n_gores = int(gores)
     theta_g = theta_rad / n_gores
     theta_g_deg = math.degrees(theta_g)
@@ -437,11 +453,9 @@ def page_cone_calculator() -> None:
     arc_out_g = dev["arc_out"] / n_gores
     arc_in_g = dev["arc_in"] / n_gores
 
-    # Cut perimeter of one gore sector (two arcs + two radial edges)
     radial_edge = (Rout - Rin) + float(seam_allow)
     cut_perim_g = float(arc_out_g) + float(arc_in_g) + 2.0 * float(radial_edge)
 
-    # Area + weight for one gore
     area_total = _cone_sector_area(Rout, Rin, theta_rad)
     area_g = area_total / n_gores
 
@@ -451,12 +465,10 @@ def page_cone_calculator() -> None:
     gross_weight_g = logic.calculate_gross_weight(net_weight_g, logic.PERCENTAGE_ADD_FOR_GROSS_WEIGHT)
     fit_time_g = logic.calculate_fit_time(net_weight_g)
 
-    # Burning
     burn_machine = logic.get_plate_burn_machine_type(thickness)
     feedrate = logic.get_feedrate_for_thickness(thickness, logic.FEEDRATE_TABLE_IPM)
     burn_time_g = round(logic.calculate_burning_time(cut_perim_g, feedrate), 2)
 
-    # Rolling (optional)
     rolling_time_item = 0.0
     total_rolling_time = 0.0
     if add_roll:
@@ -495,8 +507,6 @@ def page_cone_calculator() -> None:
 
     add_btn = st.button("Add cone gore(s) to estimate", type="primary", key="cone_add_btn")
     if add_btn:
-        # Create a Plate-type estimate line item representing one gore.
-        # Quantity field is per-gore qty. Total pieces added = quantity (per gore).
         notes = (
             f"Cone dev | D1={float(D1):.3f}, D2={float(D2):.3f}, H={float(H):.3f}, "
             f"Rout={Rout:.3f}, Rin={Rin:.3f}, θ_total={theta_deg:.3f}°, gores={n_gores}, "
@@ -509,12 +519,8 @@ def page_cone_calculator() -> None:
             "Quantity": int(quantity),
             "Material": material,
             "Thickness (in)": float(thickness),
-
-            # For the plate table we keep Width/Length fields populated for visibility.
-            # These are NOT the true developed bounding box; they are representative.
             "Width (in)": round(float(arc_out_g), 3),
             "Length (in)": round(float(radial_edge), 3),
-
             "Bends (per item)": 0,
             "Bend Complexity": "N/A",
             "Burn Machine Type": burn_machine,
@@ -524,26 +530,21 @@ def page_cone_calculator() -> None:
             "Drill Details Summary": "",
             "Burning Time (min/item)": float(burn_time_g),
             "Bend Time (min/item)": 0.0,
-
             "Rolling Required": "Yes" if add_roll else "No",
             "Rolling Type": "Cone" if add_roll else "",
             "Rolling OD Bucket": rolling_od_bucket if add_roll else "",
             "Rolling Prebend": "Yes" if (add_roll and rolling_prebend) else "No" if add_roll else "",
             "Rolling Tight Tolerance": "Yes" if (add_roll and rolling_tight_tol) else "No" if add_roll else "",
             "Rolling Time (min/item)": float(rolling_time_item),
-
             "Net Weight (lbs/item)": round(float(net_weight_g), 2),
             "Gross Weight (lbs/item)": round(float(gross_weight_g), 2),
             "Fit Time (min/item)": float(fit_time_g),
-
             "Total Gross Weight (lbs)": round(float(gross_weight_g) * int(quantity), 2),
             "Total Burning Time (min)": round(float(burn_time_g) * int(quantity), 2),
             "Total Drilling Time (min)": 0.0,
             "Total Bend Time (min)": 0.0,
             "Total Rolling Run Time (min)": float(total_rolling_time),
             "Total Fit Time (min)": round(float(fit_time_g) * int(quantity), 2),
-
-            # Helpful extra fields (won't break anything; exports with extra columns)
             "Cone D1 (in)": float(D1),
             "Cone D2 (in)": float(D2),
             "Cone H (in)": float(H),
@@ -775,7 +776,6 @@ def page_plate() -> None:
             if not all_rows:
                 st.warning("No parts found in the uploaded STEP file(s).")
             else:
-                # Signature ensures the editor stays stable across reruns
                 sig = (
                     tuple((f.name, len(f.getvalue())) for f in step_files),
                     str(geom_units),
@@ -825,7 +825,6 @@ def page_plate() -> None:
                     },
                 )
 
-                # Persist edits so checkbox changes stick
                 st.session_state["step_parts_df"] = edited
 
                 st.markdown("**Load STEP row into Plate inputs (below)**")
@@ -849,7 +848,6 @@ def page_plate() -> None:
                             st.session_state["plate_step_bbox_h_in"] = float(row.get("Inferred Thickness (in)", 0.0) or 0.0)
                             st.session_state["plate_step_loaded_name"] = str(row.get("Source File", ""))
 
-                            # update keyed selectboxes if possible
                             try:
                                 st.session_state["plate_mat"] = str(row.get("Material", logic.MATERIALS_LIST[0]))
                             except Exception:
@@ -1156,11 +1154,8 @@ def page_plate() -> None:
 
     # ------------------------------------------------------------
     # Manual Plate entry (supports drilling + rolling)
-    # Rolling controls must be OUTSIDE st.form for dynamic reveal,
-    # so we use a normal button instead of st.form_submit_button.
     # ------------------------------------------------------------
 
-    # Plate base inputs
     c1, c2 = st.columns(2)
     with c1:
         part_name = st.text_input(
@@ -1205,7 +1200,6 @@ def page_plate() -> None:
             f"BBox H: {st.session_state.get('plate_step_bbox_h_in', 0.0):.3f} in"
         )
 
-    # Drilling (optional)
     st.markdown("#### Drilling (optional)")
     d1, d2, d3 = st.columns(3)
     with d1:
@@ -1218,11 +1212,9 @@ def page_plate() -> None:
         hole_dia_3 = st.number_input("Hole 3 dia (in)", min_value=0.0, value=0.0, step=0.0625)
         hole_qty_3 = st.number_input("Hole 3 qty", min_value=0, value=0, step=1)
 
-    # Rolling (optional) — NOW positionally right after drilling, still outside form
     st.markdown("#### Rolling (optional)")
     rolling_required = st.checkbox("Rolling required", value=False, key="plate_roll_required")
 
-    # Defaults
     rolling_type = st.session_state.get("plate_roll_type", "Cylinder")
     rolling_od_bucket = st.session_state.get("plate_roll_od", "Large OD (60\"+)")
     rolling_prebend = st.session_state.get("plate_roll_prebend", False)
@@ -1244,7 +1236,6 @@ def page_plate() -> None:
         with r4:
             rolling_tight_tol = st.checkbox("Tight tolerance", value=False, key="plate_roll_tighttol")
 
-    # STEP Weight (optional)
     st.markdown("#### STEP Weight (optional)")
     use_step_weight = st.checkbox(
         "Use STEP-derived weight for fit time (and reporting)",
@@ -1255,7 +1246,6 @@ def page_plate() -> None:
 
     st.divider()
 
-    # Add button (not a form submit) so rolling reveals instantly
     add = st.button("Add plate to estimate", type="primary", key="plate_add_btn")
 
     if add:
@@ -1345,6 +1335,7 @@ def page_plate() -> None:
         st.success("Plate added.")
         st.rerun()
 
+
 def page_structural() -> None:
     st.header("Structural")
     if not logic.AISC_TYPES_TO_LABELS_MAP:
@@ -1421,17 +1412,12 @@ def page_structural() -> None:
         st.success("Structural added.")
         st.rerun()
 
-
-    # ------------------------------------------------------------
-    # Structural nesting / bar optimization (mix of multiple stock lengths)
-    # ------------------------------------------------------------
     with st.expander("Structural nesting optimization (bar cutting)", expanded=False):
         st.caption(
             "Uses the Structural items currently in your estimate (their lengths × quantities) and optimizes bar usage. "
             "Supports mixing multiple stock lengths and optional quantity limits per stock length."
         )
 
-        # Gather structural cuts from the estimate
         rows = st.session_state.get("estimate_parts", [])
         cuts_with_qty = []
         for r in rows:
@@ -1485,12 +1471,6 @@ def page_structural() -> None:
                     "Optimization objective",
                     options=["waste", "bars", "cost", "balanced"],
                     index=0,
-                    help=(
-                        "waste: minimize total drop\n"
-                        "bars: minimize bar count\n"
-                        "cost: minimize total bar cost (requires cost= on stock lines)\n"
-                        "balanced: strongly prefers fewer bars, then waste"
-                    ),
                     key="struct_objective",
                 )
                 trials = st.number_input(
@@ -1499,7 +1479,6 @@ def page_structural() -> None:
                     max_value=5000,
                     value=600,
                     step=50,
-                    help="More trials can improve utilization but may run slightly slower.",
                     key="struct_trials",
                 )
 
@@ -1509,7 +1488,6 @@ def page_structural() -> None:
                     line = raw.strip()
                     if not line:
                         continue
-                    # Allow commas or spaces
                     parts = [p.strip() for p in line.replace(";", ",").split(",") if p.strip()]
                     try:
                         L = float(parts[0])
@@ -1531,7 +1509,6 @@ def page_structural() -> None:
                             except Exception:
                                 pass
                         else:
-                            # Support "480 10" meaning length, qty
                             try:
                                 if qty is None:
                                     qv = int(float(p))
@@ -1543,7 +1520,6 @@ def page_structural() -> None:
 
             stock_options = _parse_stock_options(stock_text)
 
-            # Quick preview of what we're optimizing
             with st.expander("Cuts being optimized", expanded=False):
                 df_cuts = pd.DataFrame(
                     [{"Part": c.get("name", ""), "Length (in)": c["length"], "Qty": c["qty"]} for c in cuts_with_qty]
@@ -1710,9 +1686,13 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
             weld_time_hr += float(r.get("Total Weld Time (hours)", 0.0) or 0.0)
             weld_wire_lbs += float(r.get("Total Weld Wire (lbs)", 0.0) or 0.0)
 
+    setup = _calculate_setup_times(rows)
+
     return {
         "plate_total_gross_weight": plate_wt,
         "structural_total_gross_weight": struct_wt,
+
+        # Run times
         "grand_total_laser_burn_time": laser_burn_t,
         "grand_total_kinetic_burn_time": kinetic_burn_t,
         "grand_total_plate_drilling_time": drill_t,
@@ -1720,11 +1700,29 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "grand_total_structural_cutting_time": str_cut_t,
         "grand_total_fit_time": fit_t,
         "grand_total_roll_time": roll_t,
+
+        # Setup times (NEW)
+        "laser_setup_time_min": setup["laser_setup_min"],
+        "kinetic_setup_time_min": setup["kinetic_setup_min"],
+        "saw_setup_time_min": setup["saw_setup_min"],
+        "laser_setup_count": setup["laser_setup_count"],
+        "kinetic_setup_count": setup["kinetic_setup_count"],
+        "saw_setup_count": setup["saw_setup_count"],
+
+        # Totals per process (run + setup)
+        "laser_total_time_min": laser_burn_t + setup["laser_setup_min"],
+        "kinetic_total_time_min": kinetic_burn_t + setup["kinetic_setup_min"],
+        "saw_total_time_min": str_cut_t + setup["saw_setup_min"],
+
+        # Welding
         "grand_total_weld_time_hours": weld_time_hr,
         "grand_total_weld_wire_lbs": weld_wire_lbs,
+
+        # Perimeter
         "grand_total_plate_perimeter_in": perimeter_total_in,
         "grand_total_structural_end_perimeter_in": structural_end_perimeter_total_in,
         "grand_total_combined_perimeter_in": perimeter_total_in + structural_end_perimeter_total_in,
+
         "combined_overall_gross_weight": plate_wt + struct_wt,
     }
 
@@ -1749,11 +1747,27 @@ def page_summary() -> None:
     p2.metric("Structural end perimeter (in)", f"{totals['grand_total_structural_end_perimeter_in']:.2f}")
     p3.metric("Combined perimeter (in)", f"{totals['grand_total_combined_perimeter_in']:.2f}")
 
-    t1, t2, t3, t4 = st.columns(4)
-    t1.metric("Laser time (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
-    t2.metric("Kinetic time (min)", f"{totals['grand_total_kinetic_burn_time']:.2f}")
-    t3.metric("Plate drilling (min)", f"{totals['grand_total_plate_drilling_time']:.2f}")
-    t4.metric("Saw time (min)", f"{totals['grand_total_structural_cutting_time']:.2f}")
+    st.subheader("Cutting time breakdown (run vs setup)")
+
+    l1, l2, l3 = st.columns(3)
+    l1.metric("Laser run (min)", f"{totals['grand_total_laser_burn_time']:.2f}")
+    l2.metric("Laser setup (min)", f"{totals['laser_setup_time_min']:.2f}")
+    l3.metric("Laser total (min)", f"{totals['laser_total_time_min']:.2f}")
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Kinetic run (min)", f"{totals['grand_total_kinetic_burn_time']:.2f}")
+    k2.metric("Kinetic setup (min)", f"{totals['kinetic_setup_time_min']:.2f}")
+    k3.metric("Kinetic total (min)", f"{totals['kinetic_total_time_min']:.2f}")
+
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Saw run (min)", f"{totals['grand_total_structural_cutting_time']:.2f}")
+    s2.metric("Saw setup (min)", f"{totals['saw_setup_time_min']:.2f}")
+    s3.metric("Saw total (min)", f"{totals['saw_total_time_min']:.2f}")
+
+    # Existing drilling metric (kept separate)
+    d1, d2 = st.columns(2)
+    d1.metric("Plate drilling (min)", f"{totals['grand_total_plate_drilling_time']:.2f}")
+    d2.metric("Plate bending (min)", f"{totals['grand_total_plate_bend_time']:.2f}")
 
     with st.expander("Estimate line items", expanded=False):
         st.dataframe(rows, use_container_width=True)
