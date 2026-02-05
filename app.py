@@ -3,22 +3,14 @@ import os
 import hmac
 import datetime
 import math
-import base64
-import re
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple
 
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
 
 import logic
 from dxf_plate import parse_dxf_plate_single_part_geometry, render_part_thumbnail_data_uri
-
-# Optional: local OCR (recommended for on-prem; Streamlit Cloud may need extra setup)
-try:
-    import pytesseract  # type: ignore
-except Exception:
-    pytesseract = None
 
 
 # ============================================================
@@ -50,10 +42,6 @@ def _init_state() -> None:
     # Persist STEP parts table edits so checkbox changes stick across reruns
     st.session_state.setdefault("step_parts_df", None)
     st.session_state.setdefault("step_parts_signature", None)
-
-    # OCR import state (NEW)
-    st.session_state.setdefault("ocr_plate_df", None)
-    st.session_state.setdefault("ocr_last_upload_sig", None)
 
 
 def _get_password_from_secrets_or_env() -> str:
@@ -200,7 +188,6 @@ def _export_csv_bytes(rows: List[Dict[str, Any]]) -> bytes:
     header = [k for k in preferred_order if k in all_keys] + sorted([k for k in all_keys if k not in preferred_order])
 
     import csv
-
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=header, extrasaction="ignore")
     w.writeheader()
@@ -403,450 +390,6 @@ def _cone_development_truncated(D1: float, D2: float, H: float, use_mean_diam: b
 def _cone_sector_area(Rout: float, Rin: float, theta_rad: float) -> float:
     """Area of an annular sector."""
     return 0.5 * float(theta_rad) * (float(Rout) ** 2 - float(Rin) ** 2)
-
-
-# ============================================================
-# OCR IMPORT (Plate) - NEW
-# ============================================================
-
-def _img_to_data_uri(img: Image.Image, fmt: str = "PNG") -> str:
-    buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/{fmt.lower()};base64,{b64}"
-
-
-
-def _otsu_threshold(gray_arr):
-    import numpy as np
-    hist = np.bincount(gray_arr.ravel(), minlength=256)
-    total = gray_arr.size
-    sum_total = (np.arange(256) * hist).sum()
-
-    sumB = 0
-    wB = 0
-    max_var = 0
-    threshold = 128
-
-    for t in range(256):
-        wB += hist[t]
-        if wB == 0:
-            continue
-        wF = total - wB
-        if wF == 0:
-            break
-        sumB += t * hist[t]
-        mB = sumB / wB
-        mF = (sum_total - sumB) / wF
-        var_between = wB * wF * (mB - mF) ** 2
-        if var_between > max_var:
-            max_var = var_between
-            threshold = t
-    return threshold
-
-
-def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
-    import numpy as np
-
-    img = ImageOps.exif_transpose(img).convert("L")
-
-    # Upscale hard (snips have tiny text)
-    w, h = img.size
-    img = img.resize((w * 5, h * 5))
-
-    # Increase contrast
-    img = ImageEnhance.Contrast(img).enhance(2.5)
-
-    arr = np.array(img)
-    t = _otsu_threshold(arr)
-
-    # Binarize (makes dimension text pop)
-    bin_arr = (arr > t).astype("uint8") * 255
-    return Image.fromarray(bin_arr, mode="L")
-
-def _run_ocr_text(img: Image.Image) -> str:
-    if pytesseract is None:
-        return ""
-    try:
-        cfg = "--psm 6"
-        return pytesseract.image_to_string(img, config=cfg) or ""
-    except Exception:
-        return ""
-
-
-def _normalize_ocr_text(t: str) -> str:
-    t = (t or "").replace("Ø", "DIA ").replace("⌀", "DIA ")
-    t = t.replace("THK.", "THK").replace("THICK", "THK")
-    t = t.replace("IN.", "IN").replace("INCH", "IN")
-    t = re.sub(r"[,\t]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-def _parse_fraction(tok: str) -> Optional[float]:
-    tok = tok.strip()
-
-    # 1-3/16
-    m = re.match(r"^(\d+)\s*-\s*(\d+)\s*/\s*(\d+)$", tok)
-    if m:
-        whole = int(m.group(1))
-        num = int(m.group(2))
-        den = int(m.group(3))
-        if den != 0:
-            return whole + (num / den)
-        return None
-
-    # 3/8
-    m = re.match(r"^(\d+)\s*/\s*(\d+)$", tok)
-    if m:
-        num = int(m.group(1))
-        den = int(m.group(2))
-        if den != 0:
-            return num / den
-        return None
-
-    return None
-
-
-def _token_to_number(tok: str) -> Optional[float]:
-    tok = tok.strip()
-    frac = _parse_fraction(tok)
-    if frac is not None:
-        return frac
-
-    tok2 = tok.replace('"', "").replace("'", "")
-    tok2 = re.sub(r"[^0-9.\-]", "", tok2)
-    try:
-        if tok2 in {"", "-", ".", "-."}:
-            return None
-        return float(tok2)
-    except Exception:
-        return None
-
-
-
-def _extract_overall_dims(text: str) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    First tries explicit A X B (e.g., 10 X 20).
-    If not found, fallback:
-      - largest dimension-like value -> Length
-      - best candidate under Length -> Width
-    Returns (width_in, length_in, note)
-    """
-    t = (text or "").upper()
-
-    # 1) Try explicit A X B
-    pairs = []
-    pattern = re.compile(
-        r"(?P<a>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))\s*X\s*(?P<b>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))",
-        re.IGNORECASE,
-    )
-    for m in pattern.finditer(t):
-        a = _token_to_number(m.group("a"))
-        b = _token_to_number(m.group("b"))
-        if a is not None and b is not None:
-            pairs.append((a, b))
-
-    if pairs:
-        a, b = sorted(pairs, key=lambda x: x[0] * x[1], reverse=True)[0]
-        return min(a, b), max(a, b), ""
-
-    # 2) Fallback: harvest dimension-like numbers
-    dim_tokens = re.findall(r"(\d+\s*-\s*\d+/\d+|\d+/\d+|\d+\.\d+|\d+)", t)
-    values = []
-    for tok in dim_tokens:
-        v = _token_to_number(tok)
-        if v is None:
-            continue
-        # filter out tiny noise
-        if v < 1.0:
-            continue
-        values.append(v)
-
-    if not values:
-        return None, None, "Overall dims not detected"
-
-    L = max(values)
-
-    # choose best width candidate: < 0.9*L and reasonably sized
-    candidates = [v for v in values if (v < L * 0.9 and v >= 2.0)]
-    W = max(candidates) if candidates else None
-
-    if W is None:
-        return None, L, "Width not detected (length detected)"
-    return min(W, L), max(W, L), ""
-
-def _extract_thickness(text: str) -> Tuple[Optional[float], str]:
-    """
-    Thickness from THK / T= / PL
-    Converts mm->in if 'mm' present in the text near thickness tokens.
-    """
-    note = ""
-    mm_present = bool(re.search(r"\bmm\b", text, re.IGNORECASE))
-
-    pattern = re.compile(
-        r"\b(THK|T=|T\s*=|PL)\s*(?P<t>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))\b",
-        re.IGNORECASE,
-    )
-    m = pattern.search(text)
-    if m:
-        tval = _token_to_number(m.group("t"))
-        if tval is None:
-            return None, "Thickness detected but could not parse"
-        if mm_present:
-            return tval / 25.4, note
-        return tval, note
-
-    pattern2 = re.compile(
-        r"\b(?P<t>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))\s*PL\b",
-        re.IGNORECASE,
-    )
-    m2 = pattern2.search(text)
-    if m2:
-        tval = _token_to_number(m2.group("t"))
-        if tval is None:
-            return None, "Thickness detected but could not parse"
-        if mm_present:
-            return tval / 25.4, note
-        return tval, note
-
-    return None, "Thickness not detected"
-
-
-
-def _extract_holes(text: str) -> Tuple[Optional[int], Optional[float], str]:
-    """
-    Robust hole detector:
-      - 8X Ø 13/32 THRU
-      - BX @ 13/32 THRU  (common OCR misreads)
-      - 8X 13/32
-      - DIA .500 (qty unknown)
-    """
-    t = (text or "").upper()
-
-    # Common OCR misreads
-    t = t.replace("BX", "8X").replace("B X", "8 X").replace("@", "DIA ")
-
-    # qty + dia (fraction, mixed fraction, or decimal)
-    pattern_qty_dia = re.compile(
-        r"(?P<qty>\d+)\s*X\s*(DIA\s*)?(?P<dia>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))",
-        re.IGNORECASE,
-    )
-    m = pattern_qty_dia.search(t)
-    if m:
-        try:
-            qty = int(m.group("qty"))
-        except Exception:
-            qty = None
-        dia = _token_to_number(m.group("dia"))
-        if qty is not None and dia is not None:
-            return qty, dia, ""
-
-    # dia only
-    pattern_dia_only = re.compile(
-        r"\bDIA\s*(?P<dia>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))\b",
-        re.IGNORECASE,
-    )
-    m2 = pattern_dia_only.search(t)
-    if m2:
-        dia = _token_to_number(m2.group("dia"))
-        if dia is not None:
-            return None, dia, "Hole qty not detected"
-
-    return None, None, "Holes not detected"
-
-def _snap_thickness_to_list(t_in: float) -> float:
-    try:
-        opts = [float(x) for x in logic.THICKNESS_LIST]
-        if not opts:
-            return float(t_in)
-        return float(min(opts, key=lambda x: abs(x - float(t_in))))
-    except Exception:
-        return float(t_in)
-
-
-def page_ocr_import_plate() -> None:
-    st.header("OCR Import (Plate)")
-    st.caption(
-        "Upload part-detail snippets (PNG/JPG). OCR suggests **Width / Length / Thickness + Hole Qty / Dia**. "
-        "Edit the table, then load a selected row into the Plate form."
-    )
-
-    if pytesseract is None:
-        st.warning(
-            "Local OCR is not available (pytesseract not installed). "
-            "If you're running locally, install with `pip install pytesseract` and install the Tesseract engine. "
-            "On Streamlit Cloud, local OCR typically needs additional system packages."
-        )
-
-    cA, cB, cC = st.columns([1.2, 1.2, 2])
-    with cA:
-        default_qty = st.number_input("Default Qty", min_value=1, value=1, step=1, key="ocr_default_qty")
-    with cB:
-        default_material = st.selectbox("Default Material", options=logic.MATERIALS_LIST, index=0, key="ocr_default_mat")
-    with cC:
-        default_thickness = st.selectbox("Default Thickness (fallback)", options=logic.THICKNESS_LIST, index=0, key="ocr_default_thk")
-
-    files = st.file_uploader(
-        "Upload snippet images",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        key="ocr_upload_images_multi",
-    )
-
-    run = st.button("Run OCR", type="primary", disabled=not files)
-    if run and files:
-        rows = []
-        for f in files:
-            try:
-                raw_bytes = f.getvalue()
-                img = Image.open(io.BytesIO(raw_bytes))
-                preview = img.copy()
-            except Exception:
-                continue
-
-            pre = _preprocess_for_ocr(img)
-            ocr_raw = _run_ocr_text(pre)
-            norm = _normalize_ocr_text(ocr_raw)
-
-            w, l, dims_note = _extract_overall_dims(norm)
-            thk, thk_note = _extract_thickness(norm)
-            hole_qty, hole_dia, hole_note = _extract_holes(norm)
-
-            notes = "; ".join([n for n in [dims_note, thk_note, hole_note] if n and "not detected" in n.lower()])
-
-            # fallbacks
-            if thk is None:
-                try:
-                    thk = float(default_thickness)
-                except Exception:
-                    thk = None
-
-            if thk is not None:
-                thk = _snap_thickness_to_list(float(thk))
-
-            rows.append(
-                {
-                    "Include": True,
-                    "Preview": _img_to_data_uri(preview, fmt="PNG"),
-                    "Source": f.name,
-                    "Part Name": os.path.splitext(f.name)[0],
-                    "Quantity": int(default_qty),
-                    "Material": str(default_material),
-                    "Thickness (in)": float(thk) if thk is not None else float(default_thickness),
-                    "Width (in)": float(w) if w is not None else 0.0,
-                    "Length (in)": float(l) if l is not None else 0.0,
-                    "Hole Qty": int(hole_qty) if hole_qty is not None else 0,
-                    "Hole Dia (in)": float(hole_dia) if hole_dia is not None else 0.0,
-                    "Notes": notes,
-                    "OCR Text": (ocr_raw or "").strip(),
-                }
-            )
-
-        if rows:
-            st.session_state["ocr_plate_df"] = pd.DataFrame(rows)
-        else:
-            st.session_state["ocr_plate_df"] = pd.DataFrame(
-                columns=[
-                    "Include",
-                    "Preview",
-                    "Source",
-                    "Part Name",
-                    "Quantity",
-                    "Material",
-                    "Thickness (in)",
-                    "Width (in)",
-                    "Length (in)",
-                    "Hole Qty",
-                    "Hole Dia (in)",
-                    "Notes",
-                    "OCR Text",
-                ]
-            )
-
-    df = st.session_state.get("ocr_plate_df")
-    if df is None or df.empty:
-        st.info("No OCR results yet. Upload snippets and click **Run OCR**.")
-        return
-
-    st.markdown("#### OCR Results (editable)")
-    edited = st.data_editor(
-        df,
-        use_container_width=True,
-        num_rows="fixed",
-        column_config={
-            "Include": st.column_config.CheckboxColumn("Include", default=True),
-            "Preview": st.column_config.ImageColumn("Preview", width="small"),
-            "Quantity": st.column_config.NumberColumn("Quantity", min_value=1, step=1, required=True),
-            "Material": st.column_config.SelectboxColumn("Material", options=[str(x) for x in logic.MATERIALS_LIST], required=True),
-            "Thickness (in)": st.column_config.SelectboxColumn(
-                "Thickness (in)", options=[float(x) for x in logic.THICKNESS_LIST], required=True
-            ),
-            "Width (in)": st.column_config.NumberColumn("Width (in)", format="%.3f"),
-            "Length (in)": st.column_config.NumberColumn("Length (in)", format="%.3f"),
-            "Hole Qty": st.column_config.NumberColumn("Hole Qty", min_value=0, step=1),
-            "Hole Dia (in)": st.column_config.NumberColumn("Hole Dia (in)", format="%.3f"),
-            "OCR Text": st.column_config.TextColumn("OCR Text", width="large"),
-        },
-        key="ocr_plate_editor",
-    )
-    st.session_state["ocr_plate_df"] = edited
-
-    st.divider()
-
-    selectable = edited[edited["Include"] == True].copy()  # noqa: E712
-    if selectable.empty:
-        st.warning("No rows marked Include=True.")
-        return
-
-    labels = [
-        f"{r['Source']} :: {r['Part Name']}"
-        for _, r in selectable.iterrows()
-    ]
-    sel = st.selectbox("Select an OCR row to load into the Plate form", options=labels, key="ocr_select_row")
-
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if st.button("Load selected OCR row into Plate form", type="primary", key="ocr_load_to_plate_btn"):
-            try:
-                # find row
-                src = sel.split(" :: ")[0].strip()
-                name = sel.split(" :: ")[-1].strip()
-                row = selectable[(selectable["Source"] == src) & (selectable["Part Name"] == name)].iloc[0].to_dict()
-
-                st.session_state["plate_part_name"] = str(row.get("Part Name", "OCR Plate"))
-                st.session_state["plate_qty"] = int(row.get("Quantity", 1) or 1)
-                st.session_state["plate_w"] = float(row.get("Width (in)", 0.0) or 0.0)
-                st.session_state["plate_l"] = float(row.get("Length (in)", 0.0) or 0.0)
-
-                # set material/thickness (keys exist in plate page)
-                try:
-                    st.session_state["plate_mat"] = str(row.get("Material", logic.MATERIALS_LIST[0]))
-                except Exception:
-                    pass
-                try:
-                    st.session_state["plate_thk"] = float(row.get("Thickness (in)", logic.THICKNESS_LIST[0]))
-                except Exception:
-                    pass
-
-                # optional: drop a hint into STEP loaded banner slot so the user sees source
-                st.session_state["plate_step_loaded_name"] = f"OCR: {str(row.get('Source',''))}"
-                st.session_state["plate_step_volume_in3"] = 0.0
-                st.session_state["plate_step_weight_lbs"] = 0.0
-                st.session_state["plate_step_bbox_h_in"] = 0.0
-
-                # NOTE: We do NOT auto-fill the drilling inputs on the plate page because those
-                # are local variables (not session_state). The estimator can quickly enter them
-                # after the form is loaded. We keep this v1 safe & simple.
-
-                st.success("Loaded OCR row into Plate inputs. Go to **Plate** and click **Add plate to estimate**.")
-            except Exception as e:
-                st.error(f"Could not load OCR row into plate form: {e}")
-    with col2:
-        st.caption(
-            "Tip: After loading into Plate, you can add drilling and rolling, then click **Add plate to estimate** "
-            "using your existing workflow."
-        )
 
 
 def page_cone_calculator() -> None:
@@ -1150,7 +693,7 @@ def page_plate() -> None:
             rows = []
             meshes_by_id = {}
 
-            def _snap_thickness_to_list_inner(t_in: float) -> float:
+            def _snap_thickness_to_list(t_in: float) -> float:
                 try:
                     opts = [float(x) for x in logic.THICKNESS_LIST]
                     if not opts:
@@ -1173,7 +716,7 @@ def page_plate() -> None:
                             "Row ID": row_id,
                             "Qty": 1,
                             "Material": str(logic.MATERIALS_LIST[0]),
-                            "Thickness (in)": _snap_thickness_to_list_inner(bt),
+                            "Thickness (in)": _snap_thickness_to_list(bt),
                             "Use STEP weight": True,
                             "BBox W (in)": round(bw, 3),
                             "BBox L (in)": round(bl, 3),
@@ -1194,7 +737,7 @@ def page_plate() -> None:
                         "Row ID": row_id,
                         "Qty": 1,
                         "Material": str(logic.MATERIALS_LIST[0]),
-                        "Thickness (in)": _snap_thickness_to_list_inner(bt),
+                        "Thickness (in)": _snap_thickness_to_list(bt),
                         "Use STEP weight": True,
                         "BBox W (in)": round(bw, 3),
                         "BBox L (in)": round(bl, 3),
@@ -2163,7 +1706,7 @@ def _compute_totals(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "grand_total_fit_time": fit_t,
         "grand_total_roll_time": roll_t,
 
-        # Setup times
+        # Setup times (NEW)
         "laser_setup_time_min": setup["laser_setup_min"],
         "kinetic_setup_time_min": setup["kinetic_setup_min"],
         "saw_setup_time_min": setup["saw_setup_min"],
@@ -2205,7 +1748,7 @@ def page_summary() -> None:
     c3.metric("Roll time (min)", f"{totals['grand_total_roll_time']:.2f}")
     c4.metric("Weld time (hr)", f"{totals['grand_total_weld_time_hours']:.2f}")
 
-    # Separate Plate vs Structural gross weight
+    # NEW: Separate Plate vs Structural gross weight (added under the existing top row)
     w1, w2 = st.columns(2)
     w1.metric("Plate gross weight (lbs)", f"{totals['plate_total_gross_weight']:.2f}")
     w2.metric("Structural gross weight (lbs)", f"{totals['structural_total_gross_weight']:.2f}")
@@ -2232,6 +1775,7 @@ def page_summary() -> None:
     s2.metric("Saw setup (min)", f"{totals['saw_setup_time_min']:.2f}")
     s3.metric("Saw total (min)", f"{totals['saw_total_time_min']:.2f}")
 
+    # Existing drilling metric (kept separate)
     d1, d2 = st.columns(2)
     d1.metric("Plate drilling (min)", f"{totals['grand_total_plate_drilling_time']:.2f}")
     d2.metric("Plate bending (min)", f"{totals['grand_total_plate_bend_time']:.2f}")
@@ -2259,12 +1803,7 @@ def main() -> None:
 
     with st.sidebar:
         st.title(APP_TITLE)
-        page = st.radio(
-            "Go to",
-            ["Plate", "OCR Import (Plate)", "Cone Calculator", "Structural", "Welding", "Summary"],
-            index=0,
-            key="nav_page",
-        )
+        page = st.radio("Go to", ["Plate", "Cone Calculator", "Structural", "Welding", "Summary"], index=0, key="nav_page")
         st.write("—")
         st.write(f"Items in estimate: **{len(st.session_state['estimate_parts'])}**")
         if st.button("Clear estimate", type="secondary", key="clear_estimate_btn"):
@@ -2276,8 +1815,6 @@ def main() -> None:
 
     if page == "Plate":
         page_plate()
-    elif page == "OCR Import (Plate)":
-        page_ocr_import_plate()
     elif page == "Cone Calculator":
         page_cone_calculator()
     elif page == "Structural":
