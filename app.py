@@ -416,17 +416,53 @@ def _img_to_data_uri(img: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{b64}"
 
 
+
+def _otsu_threshold(gray_arr):
+    import numpy as np
+    hist = np.bincount(gray_arr.ravel(), minlength=256)
+    total = gray_arr.size
+    sum_total = (np.arange(256) * hist).sum()
+
+    sumB = 0
+    wB = 0
+    max_var = 0
+    threshold = 128
+
+    for t in range(256):
+        wB += hist[t]
+        if wB == 0:
+            continue
+        wF = total - wB
+        if wF == 0:
+            break
+        sumB += t * hist[t]
+        mB = sumB / wB
+        mF = (sum_total - sumB) / wF
+        var_between = wB * wF * (mB - mF) ** 2
+        if var_between > max_var:
+            max_var = var_between
+            threshold = t
+    return threshold
+
+
 def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
-    img = ImageOps.exif_transpose(img)
-    img = img.convert("RGB")
-    gray = ImageOps.grayscale(img)
-    gray = ImageEnhance.Contrast(gray).enhance(2.0)
+    import numpy as np
 
-    # mild upscale helps tiny text
-    w, h = gray.size
-    gray = gray.resize((int(w * 1.5), int(h * 1.5)))
-    return gray
+    img = ImageOps.exif_transpose(img).convert("L")
 
+    # Upscale hard (snips have tiny text)
+    w, h = img.size
+    img = img.resize((w * 5, h * 5))
+
+    # Increase contrast
+    img = ImageEnhance.Contrast(img).enhance(2.5)
+
+    arr = np.array(img)
+    t = _otsu_threshold(arr)
+
+    # Binarize (makes dimension text pop)
+    bin_arr = (arr > t).astype("uint8") * 255
+    return Image.fromarray(bin_arr, mode="L")
 
 def _run_ocr_text(img: Image.Image) -> str:
     if pytesseract is None:
@@ -488,32 +524,57 @@ def _token_to_number(tok: str) -> Optional[float]:
         return None
 
 
+
 def _extract_overall_dims(text: str) -> Tuple[Optional[float], Optional[float], str]:
     """
-    Find candidates like 10 X 20, choose largest area.
+    First tries explicit A X B (e.g., 10 X 20).
+    If not found, fallback:
+      - largest dimension-like value -> Length
+      - best candidate under Length -> Width
     Returns (width_in, length_in, note)
     """
-    note = ""
+    t = (text or "").upper()
+
+    # 1) Try explicit A X B
     pairs = []
     pattern = re.compile(
         r"(?P<a>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))\s*X\s*(?P<b>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))",
         re.IGNORECASE,
     )
-    for m in pattern.finditer(text):
+    for m in pattern.finditer(t):
         a = _token_to_number(m.group("a"))
         b = _token_to_number(m.group("b"))
-        if a is None or b is None:
-            continue
-        pairs.append((a, b))
+        if a is not None and b is not None:
+            pairs.append((a, b))
 
-    if not pairs:
+    if pairs:
+        a, b = sorted(pairs, key=lambda x: x[0] * x[1], reverse=True)[0]
+        return min(a, b), max(a, b), ""
+
+    # 2) Fallback: harvest dimension-like numbers
+    dim_tokens = re.findall(r"(\d+\s*-\s*\d+/\d+|\d+/\d+|\d+\.\d+|\d+)", t)
+    values = []
+    for tok in dim_tokens:
+        v = _token_to_number(tok)
+        if v is None:
+            continue
+        # filter out tiny noise
+        if v < 1.0:
+            continue
+        values.append(v)
+
+    if not values:
         return None, None, "Overall dims not detected"
 
-    pairs_sorted = sorted(pairs, key=lambda x: (x[0] * x[1]), reverse=True)
-    a, b = pairs_sorted[0]
-    w, l = (min(a, b), max(a, b))
-    return w, l, note
+    L = max(values)
 
+    # choose best width candidate: < 0.9*L and reasonably sized
+    candidates = [v for v in values if (v < L * 0.9 and v >= 2.0)]
+    W = max(candidates) if candidates else None
+
+    if W is None:
+        return None, L, "Width not detected (length detected)"
+    return min(W, L), max(W, L), ""
 
 def _extract_thickness(text: str) -> Tuple[Optional[float], str]:
     """
@@ -552,19 +613,26 @@ def _extract_thickness(text: str) -> Tuple[Optional[float], str]:
     return None, "Thickness not detected"
 
 
+
 def _extract_holes(text: str) -> Tuple[Optional[int], Optional[float], str]:
     """
-    Holes:
-      4X DIA .500
-      4 X Ø 1.00
-      DIA .500 (qty unknown)
+    Robust hole detector:
+      - 8X Ø 13/32 THRU
+      - BX @ 13/32 THRU  (common OCR misreads)
+      - 8X 13/32
+      - DIA .500 (qty unknown)
     """
-    note = ""
+    t = (text or "").upper()
+
+    # Common OCR misreads
+    t = t.replace("BX", "8X").replace("B X", "8 X").replace("@", "DIA ")
+
+    # qty + dia (fraction, mixed fraction, or decimal)
     pattern_qty_dia = re.compile(
         r"(?P<qty>\d+)\s*X\s*(DIA\s*)?(?P<dia>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))",
         re.IGNORECASE,
     )
-    m = pattern_qty_dia.search(text)
+    m = pattern_qty_dia.search(t)
     if m:
         try:
             qty = int(m.group("qty"))
@@ -572,20 +640,20 @@ def _extract_holes(text: str) -> Tuple[Optional[int], Optional[float], str]:
             qty = None
         dia = _token_to_number(m.group("dia"))
         if qty is not None and dia is not None:
-            return qty, dia, note
+            return qty, dia, ""
 
+    # dia only
     pattern_dia_only = re.compile(
         r"\bDIA\s*(?P<dia>(\d+\s*-\s*\d+/\d+)|(\d+/\d+)|(\d+(\.\d+)?))\b",
         re.IGNORECASE,
     )
-    m2 = pattern_dia_only.search(text)
+    m2 = pattern_dia_only.search(t)
     if m2:
         dia = _token_to_number(m2.group("dia"))
         if dia is not None:
             return None, dia, "Hole qty not detected"
 
     return None, None, "Holes not detected"
-
 
 def _snap_thickness_to_list(t_in: float) -> float:
     try:
