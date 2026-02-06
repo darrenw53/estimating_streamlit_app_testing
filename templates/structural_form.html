@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Structural Estimator Input</title>
+    <style>
+        body { font-family: sans-serif; margin: 0; }
+        header { background-color: #ffffff; padding: 10px 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; border-bottom: 3px solid #007bff;}
+        header img { height: 50px; margin-right: 20px; }
+        header h1 { font-weight: 300; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); max-width: 800px; margin: 30px auto; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="number"], input[type="text"], select { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        input[type="submit"], .button-link { 
+            background-color: #28a745; color: white; padding: 10px 20px; text-align:center;
+            border: none; border-radius: 4px; cursor: pointer; font-size: 16px; text-decoration:none; display:inline-block; margin-top:10px;
+         }
+        input[type="submit"]:hover, .button-link:hover { background-color: #218838; }
+        h1, h2 { color: #333; }
+        .nav-links { margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid #eee; }
+        .nav-links a { margin-right:15px; }
+        .checkbox-group { display: flex; align-items: center; margin-bottom: 20px; gap: 10px; }
+        .checkbox-group input { width: auto; margin-bottom: 0; }
+        .checkbox-group label { margin-bottom: 0; font-weight: normal; }
+    </style>
+</head>
+<body>
+    {% extends "base.html" %}
+    
+    {% block title %}Structural Estimator{% endblock %}
+    
+    {% block content %}
+    <div class="nav-links">
+        <a href="{{ url_for('home') }}" class="button-link" style="background-color: #6c757d;">Home</a>
+        <a href="{{ url_for('plate_form_route') }}" class="button-link" style="background-color: #007bff;">Add Plate Part</a>
+        <a href="{{ url_for('view_estimate_summary') }}" class="button-link">View Current Estimate ({{ estimate_count }} entries)</a>
+    </div>
+    <h2>New Structural Entry</h2>
+    <form action="{{ url_for('calculate_structural') }}" method="POST">
+        <label for="part_name">Part Name / Number:</label>
+        <input type="text" name="part_name" id="part_name" placeholder="e.g., Column-C1" required>
+
+        <label for="quantity">Quantity of these Members:</label>
+        <input type="number" name="quantity" id="quantity" value="1" min="1" required>
+
+        <label for="structural_type">Structural Type:</label>
+        <select name="structural_type" id="structural_type" required>
+            <option value="">-- Select Type --</option>
+            {% for type in structural_types_list %}
+            <option value="{{ type }}">{{ type }}</option>
+            {% endfor %}
+        </select>
+
+        <label for="shape_label">Shape Label:</label>
+        <select name="shape_label" id="shape_label" required>
+            <option value="">-- Select Type First --</option>
+        </select>
+
+        <label for="length_in">Length (inches):</label>
+        <input type="number" name="length_in" id="length_in" step="any" required>
+
+        <div class="checkbox-group">
+            <input type="checkbox" name="is_mitered" id="is_mitered" value="true">
+            <label for="is_mitered">Mitered Cut? (doubles saw time)</label>
+        </div>
+
+        <input type="submit" value="Calculate & Add Structural Part to Estimate">
+    </form>
+    
+    <script>
+        document.getElementById('structural_type').addEventListener('change', function() {
+            var structuralType = this.value;
+            var shapeLabelDropdown = document.getElementById('shape_label');
+            shapeLabelDropdown.innerHTML = '<option value="">-- Loading Shapes --</option>';
+            if (structuralType) {
+                fetch('/get_shapes_for_type/' + structuralType)
+                    .then(response => response.json())
+                    .then(data => {
+                        shapeLabelDropdown.innerHTML = '<option value="">-- Select Shape Label --</option>';
+                        data.forEach(function(shape) {
+                            var option = document.createElement('option');
+                            option.value = shape;
+                            option.text = shape;
+                            shapeLabelDropdown.appendChild(option);
+                        });
+                    })
+                    .catch(error => {
+                        console.error('Error fetching shapes:', error);
+                        shapeLabelDropdown.innerHTML = '<option value="">-- Error Loading --</option>';
+                    });
+            } else {
+                shapeLabelDropdown.innerHTML = '<option value="">-- Select Type First --</option>';
+            }
+        });
+    </script>
+    {% endblock %}
+</body>
+</html>
