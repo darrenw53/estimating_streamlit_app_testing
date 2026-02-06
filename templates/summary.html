@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Current Estimate Summary</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; }
+        header { background-color: #ffffff; padding: 10px 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; border-bottom: 3px solid #007bff;}
+        header img { height: 50px; margin-right: 20px; }
+        header h1 { font-weight: 300; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); max-width: 960px; margin: 30px auto;}
+        h1, h2, h3, h4 { color: #333; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 10px; font-size: 0.9em; }
+        th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; }
+        th { background-color: #e9ecef; width: 35%;}
+        .part-entry { border: 1px solid #ccc; padding: 15px; margin-bottom: 15px; border-radius: 5px; background-color:#f9f9f9; }
+        .actions a, .actions button, input[type="submit"]  { margin-right: 10px; text-decoration: none; color: #fff; background-color: #007bff; padding: 10px 15px; border-radius: 4px; border:none; font-size:1em; cursor:pointer; display: inline-block; margin-top: 10px; }
+        .actions a:hover, .actions button:hover, input[type="submit"]:hover { background-color: #0056b3; }
+        .actions .clear { background-color: #dc3545; }
+        .actions .clear:hover { background-color: #c82333; }
+        .actions .add-structural { background-color: #28a745; }
+        .actions .add-structural:hover { background-color: #218838; }
+        .action-welding { background-color: #fd7e14; }
+        .action-welding:hover { background-color: #e36a02; }
+        .yield-button { background-color: #ffc107; color:black !important; }
+        .yield-button:hover { background-color: #e0a800; }
+        .totals-section, .yield-section { margin-top: 30px; padding-top: 20px; border-top: 2px solid #007bff;}
+        .yield-shape-block { margin-bottom: 25px; padding: 15px; border: 1px solid #dee2e6; border-radius: .25rem; }
+        .best-yield-option { background-color: #d4edda; font-weight: bold; padding: 5px; margin-top:5px; border-radius: .2rem;}
+    </style>
+</head>
+<body>
+    {% extends "base.html" %}
+    
+    {% block title %}Estimate Summary{% endblock %}
+    
+    {% block content %}
+    <div class="actions">
+        <a href="{{ url_for('home') }}" class="button-link" style="background-color: #6c757d;">Home</a>
+        <a href="{{ url_for('plate_form_route') }}">Add Plate Part</a>
+        <a href="{{ url_for('structural_form_route') }}" class="add-structural">Add Structural Part</a>
+        <a href="{{ url_for('welding_calculator_form') }}" class="action-welding">Welding Calculator</a>
+        {% if estimate_parts %}
+            <a href="{{ url_for('export_csv') }}">Download Estimate as CSV</a>
+            <a href="{{ url_for('clear_estimate') }}" class="clear">Clear Entire Estimate</a>
+        {% endif %}
+    </div>
+
+    <h2>Current Estimate</h2>
+    <p>Number of part entries: {{ estimate_count }}</p>
+    
+    {% if not estimate_parts %}
+        <p>Your estimate is currently empty. Add some parts!</p>
+    {% else %}
+        <h3>Estimate Details:</h3>
+        {% for part in estimate_parts %}
+            <div class="part-entry">
+                <h4>Entry {{ loop.index }}: {{ part.get('Part Name', 'N/A') }} ({{ part['Estimation Type'] }})</h4>
+                <table>
+                    {% if part['Estimation Type'] == 'Plate' %}
+                        <tr><th>Quantity</th><td>{{ part.get('Quantity', 'N/A') }}</td></tr>
+                        <tr><th>Material</th><td>{{ part.get('Material', 'N/A') }}</td></tr>
+                        <tr><th>Thickness</th><td>{{ "%.4f"|format(part.get('Thickness (in)', 0)) }} in</td></tr>
+                        <tr><th>Width x Length</th><td>{{ "%.2f"|format(part.get('Width (in)',0)) }} x {{ "%.2f"|format(part.get('Length (in)',0)) }} in</td></tr>
+                        <tr><th>Totals for this Entry</th><td>GrossWt: {{ "%.2f"|format(part.get('Total Gross Weight (lbs)',0)) }} lbs | Burn: {{ "%.2f"|format(part.get('Total Burning Time (min)',0)) }}m | Drill: {{ "%.2f"|format(part.get('Total Drilling Time (min)',0)) }}m | Bend: {{ "%.2f"|format(part.get('Total Bend Time (min)',0)) }}m | Fit: {{ "%.2f"|format(part.get('Total Fit Time (min)',0)) }}m</td></tr>
+                    {% elif part['Estimation Type'] == 'Structural' %}
+                        <tr><th>Quantity</th><td>{{ part.get('Quantity', 'N/A') }}</td></tr>
+                        <tr><th>Shape</th><td>{{ part.get('Structural Type', 'N/A') }} - {{ part.get('Shape Label', 'N/A') }}</td></tr>
+                        <tr><th>Length</th><td>{{ "%.2f"|format(part.get('Length (in)', 0)) }} in</td></tr>
+                        <tr><th>Mitered Cut</th><td>{{ part.get('Mitered Cut', 'No') }}</td></tr>
+                        <tr><th>Totals for this Entry</th><td>GrossWt: {{ "%.2f"|format(part.get('Total Gross Weight (lbs)',0)) }} lbs | Cut: {{ "%.2f"|format(part.get('Total Cutting Time (min)',0)) }}m | Fit: {{ "%.2f"|format(part.get('Total Fit Time (min)',0)) }}m</td></tr>
+                    {% elif part['Estimation Type'] == 'Welding' %}
+                        <tr><th>Weld Details</th><td>{{ part.get('Weld Details Summary', 'N/A') }}</td></tr>
+                        <tr><th>Total Weld Wire</th><td>{{ "%.2f"|format(part.get('Total Weld Wire (lbs)',0)) }} lbs</td></tr>
+                        <tr><th>Total Weld Time</th><td>{{ "%.2f"|format(part.get('Total Weld Time (hours)',0)) }} hours</td></tr>
+                    {% endif %}
+                </table>
+            </div>
+        {% endfor %}
+    {% endif %}
+    
+    {% if estimate_parts %}
+    <div class="totals-section">
+        <h2>Grand Totals for Estimate</h2>
+        {% if totals.has_plate_entries %}
+            <h3>Plate Totals:</h3>
+            <p>Total Plate Gross Weight: {{ "%.2f"|format(totals.plate_total_gross_weight) }} lbs</p>
+            {% if totals.grand_total_laser_burn_time > 0 or totals.grand_total_kinetic_burn_time > 0 %}
+                <p>Total Laser Burn Time: {{ "%.2f"|format(totals.grand_total_laser_burn_time) }} min</p>
+                <p>Total Kinetic Burn Time: {{ "%.2f"|format(totals.grand_total_kinetic_burn_time) }} min</p>
+            {% endif %}
+            <p>Total Plate Drilling Time: {{ "%.2f"|format(totals.grand_total_plate_drilling_time) }} min</p>
+            <p>Total Plate Bend Time: {{ "%.2f"|format(totals.grand_total_plate_bend_time) }} min</p>
+        {% endif %}
+        {% if totals.has_structural_entries %}
+            <h3>Structural Totals:</h3>
+            <p>Total Structural Gross Weight: {{ "%.2f"|format(totals.structural_total_gross_weight) }} lbs</p>
+            <p>Total Structural Cutting Time: {{ "%.2f"|format(totals.grand_total_structural_cutting_time) }} min</p>
+        {% endif %}
+        
+        <h3>Overall Totals:</h3>
+        <p>Combined Overall Gross Weight (All Types): {{ "%.2f"|format(totals.combined_overall_gross_weight) }} lbs</p>
+        <p>Overall Total Fit Time (All Types): {{ "%.2f"|format(totals.grand_total_fit_time) }} min</p>
+        {% if totals.grand_total_weld_time_hours > 0 %}
+        <p><strong>Overall Total Welding Time: {{ "%.2f"|format(totals.grand_total_weld_time_hours) }} hours</strong></p>
+        <p><strong>Overall Total Weld Wire Weight: {{ "%.2f"|format(totals.grand_total_weld_wire_lbs) }} lbs</strong></p>
+        {% endif %}
+    </div>
+
+    <!-- ***** Material Yield Section ***** -->
+    <div class="yield-section">
+        <h2>Material Yield Analysis</h2>
+        {% if totals.has_plate_entries %}
+            <a href="{{ url_for('plate_yield_input_route') }}" class="button-link yield-button">Analyze Plate Yield</a>
+        {% endif %}
+        {% if totals.has_structural_entries %}
+            <a href="{{ url_for('view_estimate_summary', action='calculate_structural_yield') }}" class="button-link yield-button">Analyze Structural Yield</a>
+        {% endif %}
+
+        <!-- Plate Yield Results -->
+        {% if plate_yield_results %}
+            <h3>Plate Yield Results:</h3>
+            <!-- This section is now handled by the plate_yield_results.html template -->
+            <p>Plate yield has been calculated. <a href="{{ url_for('plate_yield_results_route') }}">View Plate Yield Graphics and Details</a></p>
+        {% endif %}
+
+        <!-- Structural Yield Input Form -->
+        {% if show_structural_yield_input %}
+            <form action="{{ url_for('process_yields_route') }}" method="POST">
+                {% if not grouped_structural_for_yield_input %}
+                    <p>No structural parts found suitable for yield calculation.</p>
+                {% else %}
+                    <h3>Structural Yield Input:</h3>
+                {% endif %}
+                {% for shape_label, parts_list in grouped_structural_for_yield_input.items() %}
+                    <div class="yield-shape-block">
+                        <h4>Yield Input for: {{ shape_label }}</h4>
+                        <label for="stock_lengths_{{shape_label}}">Enter Stock Lengths (inches, comma-separated):</label>
+                        <input type="text" name="stock_lengths_{{shape_label}}" id="stock_lengths_{{shape_label}}" placeholder="e.g., 240, 480, 720" style="width: calc(100% - 22px); padding: 8px; margin-bottom:10px;">
+                    </div>
+                {% endfor %}
+                {% if grouped_structural_for_yield_input %}
+                     <input type="submit" value="Calculate/Update Yields" class="yield-button">
+                     <a href="{{ url_for('view_estimate_summary') }}" class="button-link" style="background-color:#6c757d;">Hide Yield Form</a>
+                {% endif %}
+            </form>
+        {% endif %}
+        
+        <!-- Structural Yield Results Display -->
+        {% if structural_yield_results %}
+            <h3>Structural Yield Calculation Results:</h3>
+            {% for shape_label, yield_data in structural_yield_results.items() %}
+                <div class="yield-shape-block">
+                    <h4>Results for: {{ shape_label }}</h4>
+                    {% if yield_data.get("error") %}
+                        <p style="color:red;">{{ yield_data.error }}</p>
+                    {% elif yield_data.get("info") %}
+                        <p>{{ yield_data.info }}</p>
+                    {% elif yield_data.options %}
+                        <p>Total required material length for {{ shape_label }}: {{ "%.2f"|format(yield_data.total_required_length) }} in</p>
+                        <table>
+                            <thead><tr><th>Stock Length Used (in)</th><th>Bars Needed</th><th>Total Waste (in)</th><th>Yield % (for considered cuts)</th><th>Notes</th></tr></thead>
+                            <tbody>
+                                {% for option in yield_data.options %}
+                                <tr {% if option.is_best %}class="best-yield-option"{% endif %}>
+                                    <td>{{ "%.0f"|format(option.stock_length) }}</td>
+                                    <td>{{ option.bars_used }}</td>
+                                    <td>{{ "%.2f"|format(option.total_waste) }}</td>
+                                    <td>{{ "%.2f"|format(option.yield_percentage) }}%</td>
+                                    <td>{% if not option.can_make_all_parts %}(Warning: some parts too long){% endif %} {% if option.is_best %}<strong>(Best Option)</strong>{% endif %}</td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                        {% if yield_data.best_overall %}
+                            <p class="best-yield-option" style="text-align:center;">Best Single Stock Option for {{shape_label}} (fitting all parts):<br> Use {{ "%.0f"|format(yield_data.best_overall.stock_length) }}in stock
+                             ({{yield_data.best_overall.bars_used}} bars, {{ "%.2f"|format(yield_data.best_overall.total_waste) }}in waste, {{ "%.2f"|format(yield_data.best_overall.yield_percentage) }}% yield)</p>
+                        {% else %}
+                            <p>Could not determine a single stock option to fit ALL parts for {{shape_label}} from provided stock lengths.</p>
+                        {% endif %}
+                    {% endif %}
+                </div>
+            {% endfor %}
+        {% endif %}
+    </div>
+    {% endif %} {# This closes the main 'if estimate_parts' block #}
+    {% endblock %}
+</body>
+</html>
