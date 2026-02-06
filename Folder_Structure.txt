@@ -1,9 +1,0 @@
-/estimating_web_app/
-|-- app.py                     # Our main Flask application
-|-- logic.py                   # Core calculation logic, constants, data lists
-|-- aisc-shapes-database-v15.0.xlsx - Database v15.0.csv  # Your AISC data
-|-- /templates/
-    |-- base.html              # (Optional) A base template for common HTML
-    |-- plate_form.html        # HTML form for plate inputs
-    |-- plate_results.html     # HTML page to display plate results
-    |-- _formhelpers.html      # (Optional) For macros if forms get complex
