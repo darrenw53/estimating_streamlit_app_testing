@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Plate Nesting Yield Results</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; max-width: 1200px; margin: auto; }
+        h1, h2 { color: #333; }
+        .result-group { border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+        .yield-summary { font-size: 1.2em; font-weight: bold; margin-bottom: 20px; }
+        .layout-graphic { border: 1px solid #aaa; max-width: 100%; height: auto; margin-bottom: 10px; }
+        .sheet-container { margin-bottom: 20px; }
+        .button-link { background-color: #6c757d; color: white; padding: 10px 15px; border: none; border-radius: 4px; font-size: 1em; cursor: pointer; text-decoration: none; display:inline-block; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Plate Nesting Yield Results</h1>
+        <a href="{{ url_for('view_estimate_summary') }}" class="button-link">Back to Main Summary</a>
+        <a href="{{ url_for('plate_yield_input_route') }}" class="button-link" style="background-color:#ffc107; color:black;">Re-run Plate Yield</a>
+
+        {% if not yield_results %}
+            <p>No yield results found. Please run the plate yield analysis from the summary page.</p>
+        {% else %}
+            {% for group_key, result in yield_results.items() %}
+                <div class="result-group">
+                    <h2>Yield for: {{ group_key.replace('_', ' ') }}</h2>
+                    <div class="yield-summary">
+                        <p>Stock Sheet Size Used: {{ result.stock_size }}</p>
+                        <p>Number of Sheets Needed: {{ result.sheets_needed }}</p>
+                        <p>Overall Material Yield: <strong>{{ "%.2f"|format(result.yield_percent) }}%</strong></p>
+                        {% if result.unplaced_count > 0 %}
+                            <p style="color:red; font-weight:bold;">Warning: {{result.unplaced_count}} part(s) could not be placed!</p>
+                        {% endif %}
+                    </div>
+
+                    <h3>Layout Graphics:</h3>
+                    {% for filename in result.image_filenames %}
+                        <div class="sheet-container">
+                            <h4>Sheet {{ loop.index }}</h4>
+                            <img src="{{ url_for('static', filename='yield_images/' + filename) }}" alt="Layout for sheet {{ loop.index }}" class="layout-graphic">
+                        </div>
+                    {% else %}
+                        <p>No layouts could be generated for this group.</p>
+                    {% endfor %}
+                </div>
+            {% endfor %}
+        {% endif %}
+    </div>
+</body>
+</html>

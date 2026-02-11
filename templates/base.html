@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- The title block can be overridden by child templates -->
+    <title>{% block title %}Estimating Calculator{% endblock %}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 0; padding: 0; background-color: #f8f9fa; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+        header { 
+            background-color: #ffffff; 
+            color: #343a40; 
+            padding: 10px 20px; 
+            text-align: center; 
+            width: 100%; 
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-bottom: 3px solid #007bff;
+        }
+        header img {
+            height: 50px; /* Adjust height as needed */
+            width: auto;
+            margin-right: 20px;
+        }
+        header h1 { 
+            margin: 0; 
+            font-size: 2em; 
+            font-weight: 300;
+        }
+        .container { 
+            background-color: #fff; 
+            margin-top: 30px; 
+            padding: 30px; 
+            border-radius: 8px; 
+            box-shadow: 0 0 15px rgba(0,0,0,0.1); 
+            width: 90%;
+            max-width: 960px; 
+        }
+        /* Keep other common styles here if you wish */
+    </style>
+    <!-- Allow child templates to add their own specific styles -->
+    {% block head_styles %}{% endblock %}
+</head>
+<body>
+    <header>
+        <!-- This displays the logo. It looks in the static/images/ folder. -->
+        <img src="{{ url_for('static', filename='images/logo.png') }}" alt="Company Logo">
+        <h1>Estimating Calculator</h1>
+    </header>
+
+    <div class="container">
+        <!-- This is where the content of each individual page will go -->
+        {% block content %}{% endblock %}
+    </div>
+
+</body>
+</html>
